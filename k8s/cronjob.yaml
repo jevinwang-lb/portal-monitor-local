@@ -5,7 +5,9 @@ metadata:
   namespace: portal-monitor
 
 spec:
-  schedule: "*/10 * * * *"
+  # 00:00 / 06:00 / 12:00 / 18:00 Asia/Shanghai
+  schedule: "0 */6 * * *"
+  timeZone: Asia/Shanghai
 
   concurrencyPolicy: Forbid
 
@@ -15,7 +17,7 @@ spec:
   jobTemplate:
     spec:
       backoffLimit: 1
-      activeDeadlineSeconds: 3600
+      activeDeadlineSeconds: 600
 
       template:
         metadata:
@@ -43,11 +45,8 @@ spec:
                 - name: STATE_FILE
                   value: /data/status.json
 
-                - name: PLAYWRIGHT_HEADLESS
+                - name: LOOKUP_VERIFY_TLS
                   value: "true"
-
-                - name: IGNORE_HTTPS_ERRORS
-                  value: "false"
 
                 - name: WEBHOOK_VERIFY_TLS
                   value: "true"
@@ -55,17 +54,14 @@ spec:
                 - name: PYTHONUNBUFFERED
                   value: "1"
 
-                - name: CONCURRENCY
-                  value: "1"
-
                 - name: MAX_RETRIES
                   value: "2"
 
-                - name: DOMAIN_DELAY_SECONDS
-                  value: "5"
-
-                - name: BLOCKED_BACKOFF_SECONDS
-                  value: "30"
+                - name: WEBRISK_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: portal-monitor-webrisk
+                      key: api-key
 
                 - name: ALERT_WEBHOOK_URL
                   valueFrom:
@@ -84,12 +80,12 @@ spec:
 
               resources:
                 requests:
-                  cpu: "100m"
-                  memory: "256Mi"
+                  cpu: "50m"
+                  memory: "64Mi"
 
                 limits:
-                  cpu: "2000m"
-                  memory: "2Gi"
+                  cpu: "500m"
+                  memory: "256Mi"
 
           volumes:
             - name: domains

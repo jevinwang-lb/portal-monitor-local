@@ -286,8 +286,9 @@
       <p class="eyebrow">portal-monitor</p>
       <h1>Portal Safe Browsing Monitor</h1>
       <p class="lede">
-        用 Playwright 打开 Google Safe Browsing Transparency Report，检查配置的域名或 URL。
-        只有有效安全状态变化时，才通过 Teams Webhook 通知。Production 跑在 EKS CronJob 上，每 10 分钟一次。
+        调用 Google Web Risk Lookup API，检查配置的域名或 URL 是否在威胁列表中。
+        只有有效安全状态变化时，才通过 Teams Webhook 通知。Production 跑在 EKS CronJob 上，
+        按北京时间每 6 小时一次（每天 4 轮）。
       </p>
     </div>
   </header>
@@ -307,24 +308,24 @@
         <h2>Overview</h2>
         <h3>这个仓库解决什么问题</h3>
         <p>
-          不调用 Safe Browsing Lookup API，而是用浏览器打开公开页面
-          <code>transparencyreport.google.com/safe-browsing/search</code>，
-          读取页面英文结论，再和 <code>status.json</code> 里上次结果对比。
+          对每个域名 / URL 调一次
+          <code>webrisk.googleapis.com/v1/uris:search</code>，
+          用返回的威胁列表命中结果和 <code>status.json</code> 里上次结果对比。
         </p>
 
         <ol class="steps">
           <li>
             <span class="n">1</span>
             <div>
-              <p class="t">打开 Transparency Report</p>
-              <p class="d">对本机 Chrome 或容器 Chromium，串行检查每个域名 / URL。</p>
+              <p class="t">调 Lookup API</p>
+              <p class="d">每个条目一次 HTTP GET，带 API Key 和要查的威胁类型。</p>
             </div>
           </li>
           <li>
             <span class="n">2</span>
             <div>
-              <p class="t">解析成五种状态</p>
-              <p class="d"><code>SAFE</code> / <code>UNSAFE</code> / <code>UNKNOWN</code> / <code>NO_DATA</code> / <code>CHECK_ERROR</code></p>
+              <p class="t">解析成三种状态</p>
+              <p class="d"><code>SAFE</code> / <code>UNSAFE</code> / <code>CHECK_ERROR</code></p>
             </div>
           </li>
           <li>
@@ -345,28 +346,51 @@
 
         <p class="muted">
           适合盯一组业务域名或具体 path。状态没变不刷屏；
-          <code>UNKNOWN / NO_DATA / CHECK_ERROR</code> 不会覆盖已经落盘的有效 SAFE / UNSAFE。
+          <code>CHECK_ERROR</code> 不会覆盖已经落盘的有效 SAFE / UNSAFE。
         </p>
+
+        <div class="callout">
+          <p>
+            Lookup API 是 <strong>URL 级</strong>匹配，不是整站判定。
+            Web Risk 会对传入 URI 展开若干 host 后缀与 path 前缀组合再比对，
+            所以整个域名被列入名单时查任意路径都会命中；
+            但只有某个具体页面被标记时，查首页<strong>不会</strong>命中。
+          </p>
+          <p>
+            需要盯特定路径时，在 <code>domains.txt</code> 里直接写完整 URL。
+          </p>
+        </div>
       </section>
 
       <section id="run-once">
         <h3>一次运行做了什么</h3>
-        <p>入口是 <code>app/monitor.py</code>，依赖只有 <code>playwright==1.62.0</code>。</p>
+        <p>入口是 <code>app/monitor.py</code>，只依赖 Python 标准库，<code>requirements.txt</code> 是空的。</p>
 
         <ol>
+          <li>校验 <code>WEBRISK_API_KEY</code> 和 <code>THREAT_TYPES</code>，缺失直接以 <code>2</code> 退出。</li>
           <li>读域名列表（本机 <code>domains.txt</code>；K8s 挂 ConfigMap 到 <code>/app/domains.txt</code>）。跳过空行和 <code>#</code>，去重并保序。</li>
           <li>读状态文件（本机 <code>status.json</code>；容器 <code>/data/status.json</code>）。不存在则视为空。</li>
-          <li>启动浏览器：本机有界面 Chrome；Docker / K8s 用无头 Chromium。</li>
-          <li>逐个打开 Transparency Report，等待已知结论文案（约 20s），解析页面文本。</li>
-          <li>UNKNOWN 或异常最多重试 3 次。</li>
+          <li>逐个条目补全 URI（裸域名加 <code>https://</code>），GET <code>uris:search</code>。</li>
+          <li>异常最多重试 3 次（<code>MAX_RETRIES</code>），间隔 <code>RETRY_DELAY_SECONDS</code>。</li>
           <li>决定是否覆盖状态、是否加入通知队列。</li>
           <li>先写 <code>status.json.tmp</code> 再原子替换，避免写一半损坏。</li>
           <li>对每个 <code>status_changed</code> 事件 POST 到 <code>ALERT_WEBHOOK_URL</code>。</li>
         </ol>
 
+        <p>请求形如：</p>
+        <pre>GET https://webrisk.googleapis.com/v1/uris:search
+      ?uri=https%3A%2F%2Fportal.boruxa.com
+      &amp;threatTypes=MALWARE
+      &amp;threatTypes=SOCIAL_ENGINEERING
+      &amp;threatTypes=UNWANTED_SOFTWARE
+      &amp;key=API_KEY</pre>
+
         <div class="callout">
-          <p>检查是<strong>串行</strong>的。域名多、页面慢、或频繁 UNKNOWN 重试时，单次 Job 可能跑几分钟。</p>
-          <p>CronJob 使用 <code>concurrencyPolicy: Forbid</code>：上一轮没结束，下一轮自动触发会被跳过。</p>
+          <p>
+            检查是<strong>串行</strong>的，但一个条目只是一次 HTTP 调用，
+            百来个域名也在一分钟内跑完。<code>activeDeadlineSeconds</code> 为 600。
+          </p>
+          <p>CronJob 使用 <code>concurrencyPolicy: Forbid</code>：上一轮没结束，下一轮自动触发会被跳过。6 小时的间隔下不可能重叠。</p>
         </div>
       </section>
 
@@ -376,61 +400,60 @@
           <thead>
             <tr>
               <th style="width:7.5rem">状态</th>
-              <th style="width:28%">含义</th>
-              <th>页面特征（英文，忽略大小写）</th>
+              <th style="width:30%">含义</th>
+              <th>判定依据</th>
             </tr>
           </thead>
           <tbody>
             <tr>
               <td><span class="badge unsafe">UNSAFE</span></td>
-              <td>整站或部分页面有风险</td>
+              <td>该 URI 命中至少一个威胁列表</td>
               <td class="patterns">
-                <code>this site is unsafe</code>
-                <code>site is unsafe</code>
-                <code>some pages on this site are unsafe</code>
-                <code>pages on this site are unsafe</code>
-                <code>contains harmful content</code>
+                响应里 <code>threat.threatTypes</code> 非空。
+                命中的类型只写进日志，不进 Webhook 负载。
               </td>
             </tr>
             <tr>
               <td><span class="badge safe">SAFE</span></td>
-              <td>明确没有问题</td>
+              <td>该 URI 不在任何被查询的威胁列表中</td>
               <td class="patterns">
-                <code>no unsafe content found</code>
-                <code>no issues found</code>
-                <code>this site is safe</code>
-              </td>
-            </tr>
-            <tr>
-              <td><span class="badge warn">NO_DATA</span></td>
-              <td>Google 暂无数据</td>
-              <td class="patterns"><code>no available data</code></td>
-            </tr>
-            <tr>
-              <td><span class="badge warn">UNKNOWN</span></td>
-              <td>无法给简单结论，或文案对不上</td>
-              <td class="patterns">
-                <code>it's hard to provide a simple safety status</code>
-                （大站常见）；解析失败也会落到这里
+                响应是空对象 <code>{}</code>。
+                注意这是「未命中」，不等于 Google 主动背书该站安全。
               </td>
             </tr>
             <tr>
               <td><span class="badge neutral">CHECK_ERROR</span></td>
-              <td>访问或检测异常，重试耗尽</td>
-              <td class="patterns">运行异常，不是 Google 给出的安全结论</td>
+              <td>API 调用异常，重试耗尽</td>
+              <td class="patterns">
+                超时、<code>429</code>、<code>5xx</code>。
+                运行异常，不是 Google 给出的安全结论。
+              </td>
             </tr>
           </tbody>
         </table>
 
+        <p>默认查询三个威胁列表，可用 <code>THREAT_TYPES</code> 覆盖：</p>
+        <pre>MALWARE
+SOCIAL_ENGINEERING
+UNWANTED_SOFTWARE</pre>
+
+        <p>命中时的响应：</p>
+        <pre>{
+  "threat": {
+    "threatTypes": ["MALWARE"],
+    "expireTime": "2026-09-18T15:01:23.045123456Z"
+  }
+}</pre>
+
         <div class="callout">
           <p>
-            部分 URL（例如官方测试站 <code>testsafebrowsing.appspot.com/apiv4/.../URL/</code>）
-            页面写的是 <strong>Some pages on this site are unsafe</strong>，
-            不是 <strong>This site is unsafe</strong>。
+            <code>400</code> / <code>401</code> / <code>403</code> 表示 API Key 无效或 Web Risk API 未启用。
+            重试无意义，且剩余域名会以同样方式失败，所以<strong>立即中止整轮</strong>并以 <code>2</code> 退出，
+            而不是把整份清单打一遍再报一堆 CHECK_ERROR。
           </p>
           <p>
-            等待和解析必须同时认这两种说法，否则会超时 → <code>UNKNOWN</code> → 不告警。
-            这类测试 URL 本是给 Safe Browsing API 用的，但 Transparency Report 网页也会返回「部分页面不安全」。
+            官方测试 URL <code>testsafebrowsing.appspot.com/s/malware.html</code>
+            可以用来确认 Key 真的能拿到命中结果。
           </p>
         </div>
       </section>
@@ -451,14 +474,14 @@
             <ul>
               <li>SAFE → SAFE、UNSAFE → UNSAFE</li>
               <li>第一次是 SAFE（只落盘）</li>
-              <li>UNKNOWN / NO_DATA / CHECK_ERROR</li>
+              <li>CHECK_ERROR</li>
               <li>未配置 Webhook（仍检查、仍写状态）</li>
             </ul>
           </div>
         </div>
         <p>
-          遇到 UNKNOWN / NO_DATA / CHECK_ERROR 时，若该域名已有上次 SAFE / UNSAFE，会<strong>保留旧值</strong>，
-          避免一次页面抽风冲掉状态。首次一直 UNKNOWN 时，<code>status.json</code> 里可以没有这条 key。
+          遇到 CHECK_ERROR 时，若该域名已有上次 SAFE / UNSAFE，会<strong>保留旧值</strong>，
+          避免一次 API 抽风冲掉状态。首次就 CHECK_ERROR 时，<code>status.json</code> 里可以没有这条 key。
         </p>
         <p class="muted"><code>status.json</code> 只存每个条目最后一次有效 SAFE / UNSAFE，不存历史。</p>
       </section>
@@ -470,28 +493,38 @@
             <tr><th style="width:42%">路径</th><th>作用</th></tr>
           </thead>
           <tbody>
-            <tr><td><code>app/monitor.py</code></td><td>检查、解析、状态、Webhook、debug 输出</td></tr>
+            <tr><td><code>app/monitor.py</code></td><td>Lookup 调用、解析、状态、Webhook</td></tr>
             <tr><td><code>domains.txt</code></td><td>本机默认列表；K8s 会被 ConfigMap 覆盖</td></tr>
-            <tr><td><code>Dockerfile</code></td><td>Playwright 镜像；状态写到 <code>/data/status.json</code></td></tr>
+            <tr><td><code>Dockerfile</code></td><td><code>python:3.13-slim</code>；状态写到 <code>/data/status.json</code></td></tr>
             <tr><td><code>k8s/configmap.yaml</code></td><td>集群监控列表（改域名只 apply，不必重建镜像）</td></tr>
             <tr><td><code>k8s/pvc.yaml</code></td><td>生产状态盘 <code>portal-monitor-state</code></td></tr>
             <tr><td><code>k8s/test-pvc.yaml</code></td><td>测试状态盘 <code>portal-monitor-state-test</code></td></tr>
-            <tr><td><code>k8s/cronjob.yaml</code></td><td>生产：每 10 分钟，挂生产 PVC。镜像为 <code>IMAGE_PLACEHOLDER</code>，由 CD 注入</td></tr>
+            <tr><td><code>k8s/cronjob.yaml</code></td><td>生产：每 6 小时（北京时间），挂生产 PVC。镜像为 <code>IMAGE_PLACEHOLDER</code>，由 CD 注入</td></tr>
             <tr><td><code>k8s/test-job.yaml</code></td><td>一次性测试 Job，挂<strong>测试 PVC</strong></td></tr>
             <tr><td><code>docker-publish.yml</code></td><td>CI：构建并推送 Docker Hub 镜像</td></tr>
             <tr><td><code>cd-test-job.yml</code></td><td>CI 后自动跑测试 Job，挂<strong>测试 PVC</strong>；也可手动填 <code>v*</code> tag</td></tr>
             <tr><td><code>cd-cronjob.yml</code></td><td>手动把指定版本发布到生产 CronJob</td></tr>
           </tbody>
         </table>
-        <p class="muted">不要提交：<code>status.json</code>、<code>debug_*.txt / .png</code>、<code>docker-state/</code>、Webhook URL、<code>.env</code>。</p>
+        <p class="muted">不要提交：<code>status.json</code>、<code>docker-state/</code>、API Key、Webhook URL、<code>.env</code>。</p>
       </section>
 
       <section id="local">
         <h2>1. Local</h2>
-        <p>venv 装依赖，用本机 Google Chrome。</p>
-        <pre>export ALERT_WEBHOOK_URL='…'
-python app/monitor.py</pre>
-        <p class="muted">Zero Trust 证书问题时可临时 <code>WEBHOOK_VERIFY_TLS=false</code>，不要当生产默认。</p>
+        <p>不需要装依赖，标准库即可。先在 GCP 建好 Project、启用 Web Risk API、创建 API Key。</p>
+        <pre>export WEBRISK_API_KEY='…'
+export ALERT_WEBHOOK_URL='…'
+python3 app/monitor.py</pre>
+        <p>确认 Key 可用（应返回 <code>{"threat":{…}}</code>）：</p>
+        <pre>curl -s "https://webrisk.googleapis.com/v1/uris:search\
+?threatTypes=MALWARE\
+&amp;uri=http%3A%2F%2Ftestsafebrowsing.appspot.com%2Fs%2Fmalware.html\
+&amp;key=$WEBRISK_API_KEY"</pre>
+        <p class="muted">
+          服务端调用不带 Referer，API Key 的 Application restrictions 保持 <code>None</code>，
+          改用 API restrictions 限定只能调 Web Risk。
+          Zero Trust 证书问题时可临时关掉 TLS 校验，不要当生产默认。
+        </p>
 
         <h3>常用环境变量</h3>
         <table>
@@ -499,25 +532,27 @@ python app/monitor.py</pre>
             <tr><th style="width:38%">变量</th><th>含义</th></tr>
           </thead>
           <tbody>
+            <tr><td><code>WEBRISK_API_KEY</code></td><td>Web Risk API Key，必填，缺失直接退出</td></tr>
+            <tr><td><code>THREAT_TYPES</code></td><td>逗号分隔的威胁列表，默认 MALWARE / SOCIAL_ENGINEERING / UNWANTED_SOFTWARE</td></tr>
             <tr><td><code>DOMAINS_FILE</code></td><td>域名列表路径</td></tr>
             <tr><td><code>STATE_FILE</code></td><td>状态 JSON 路径</td></tr>
-            <tr><td><code>PLAYWRIGHT_HEADLESS</code></td><td><code>true</code> = 容器 Chromium；<code>false</code> = 本机 Chrome</td></tr>
-            <tr><td><code>IGNORE_HTTPS_ERRORS</code></td><td>浏览 Google 页时忽略证书错误</td></tr>
+            <tr><td><code>LOOKUP_VERIFY_TLS</code></td><td>调 Web Risk 时校验 TLS；生产应为 true</td></tr>
             <tr><td><code>ALERT_WEBHOOK_URL</code></td><td>Teams / Power Automate 触发器</td></tr>
             <tr><td><code>WEBHOOK_VERIFY_TLS</code></td><td>POST Webhook 时校验 TLS；生产应为 true</td></tr>
             <tr><td><code>FAIL_ON_ERROR</code></td><td><code>true</code> 时 CHECK_ERROR / Webhook 失败以非 0 退出；测试 Job 开启，生产默认关</td></tr>
-            <tr><td><code>NAVIGATION_TIMEOUT_MS</code></td><td>打开页面超时</td></tr>
-            <tr><td><code>RESULT_TIMEOUT_MS</code></td><td>等待结论文案超时</td></tr>
+            <tr><td><code>HTTP_TIMEOUT_SECONDS</code></td><td>Lookup 与 Webhook 共用，默认 15</td></tr>
             <tr><td><code>MAX_RETRIES</code></td><td>默认 3</td></tr>
+            <tr><td><code>RETRY_DELAY_SECONDS</code></td><td>重试间隔，默认 2</td></tr>
           </tbody>
         </table>
       </section>
 
       <section id="docker">
         <h2>2. Docker</h2>
-        <p>无头 Chromium，状态挂到宿主机目录。</p>
-        <pre>docker run --rm --ipc=host \
+        <p>基础镜像 <code>python:3.13-slim</code>（约 160 MB），状态挂到宿主机目录。</p>
+        <pre>docker run --rm \
   -v "$PWD/docker-state:/data" \
+  -e WEBRISK_API_KEY=… \
   -e ALERT_WEBHOOK_URL=… \
   lifebytehub/portal-monitor:sha-xxxxxxx</pre>
         <p class="muted">开发镜像用 <code>sha-xxxxxxx</code>，生产用 <code>v1.x.x</code>。不要把未验证的 SHA 直接指到 CronJob。</p>
@@ -527,14 +562,16 @@ python app/monitor.py</pre>
         <h2>3. Kubernetes</h2>
         <p>
           Namespace：<code>portal-monitor</code>。
-          Secret <code>portal-monitor-alert</code> 的 key <code>webhook-url</code> 不要进 Git。
+          两个 Secret 都不要进 Git：
+          <code>portal-monitor-webrisk</code> 的 key <code>api-key</code>、
+          <code>portal-monitor-alert</code> 的 key <code>webhook-url</code>。
         </p>
 
         <div class="pipe">
           <div class="pipe-step">
             <span class="label">配置</span>
             <strong>ConfigMap + Secret</strong>
-            <p>ConfigMap 挂到 <code>/app/domains.txt</code>；Secret 注入 <code>ALERT_WEBHOOK_URL</code>。改域名只 apply ConfigMap。</p>
+            <p>ConfigMap 挂到 <code>/app/domains.txt</code>；两个 Secret 分别注入 <code>WEBRISK_API_KEY</code> 和 <code>ALERT_WEBHOOK_URL</code>。改域名只 apply ConfigMap。</p>
           </div>
           <div class="pipe-arrow">↓</div>
           <div class="pipe-step">
@@ -546,7 +583,7 @@ python app/monitor.py</pre>
           <div class="pipe-step">
             <span class="label">生产</span>
             <strong>CronJob + 生产 PVC</strong>
-            <p><code>portal-monitor</code> 每 10 分钟跑一次，状态写在 <code>portal-monitor-state</code> 的 <code>/data/status.json</code>。</p>
+            <p><code>portal-monitor</code> 按北京时间每 6 小时跑一次，状态写在 <code>portal-monitor-state</code> 的 <code>/data/status.json</code>。</p>
           </div>
         </div>
 
@@ -557,11 +594,12 @@ python app/monitor.py</pre>
           </div>
           <div class="card">
             <h3>Production</h3>
-            <p>镜像用 <code>v1.x.x</code>。Cron <code>*/10 * * * *</code>，<code>Forbid</code> 禁止重叠。PVC 是 RWO。</p>
+            <p>镜像用 <code>v1.x.x</code>。Cron <code>0 */6 * * *</code> + <code>timeZone: Asia/Shanghai</code>，即 00:00 / 06:00 / 12:00 / 18:00。<code>Forbid</code> 禁止重叠。PVC 是 RWO。</p>
           </div>
         </div>
 
         <ul>
+          <li><code>spec.timeZone</code> 自 K8s 1.27 起为正式特性。低于 1.27 的集群会<strong>静默丢弃</strong>该字段并继续按 UTC 跑，用 <code>kubectl get cronjob portal-monitor -o jsonpath='{.spec.timeZone}'</code> 确认。</li>
           <li>gp3 多为 <code>WaitForFirstConsumer</code>：PVC 可能先 Pending，第一个用盘的 Pod 调度后才 Bound。</li>
           <li>删 Job / Pod，不要删 PVC，否则下次会当成首次检查，UNSAFE 可能再告一次。</li>
           <li>手工立刻跑生产：先 <code>suspend: true</code>，再 <code>kubectl create job --from=cronjob/portal-monitor …</code>。<code>Forbid</code> 不管手工 Job；和生产 Cron 同时跑会抢同一块 RWO。</li>
@@ -623,25 +661,40 @@ python app/monitor.py</pre>
 
       <section id="debug">
         <h2>怎么确认「没检测出来」是哪一种</h2>
-        <p>先看 Job 日志：出现 <code>Found N domain(s)</code> 说明本轮 Pod 已读到 ConfigMap。</p>
+        <p>
+          先看 Job 日志开头的配置摘要。<code>API key configured: True</code> 说明 Secret 已注入，
+          <code>Found N domain(s)</code> 说明本轮 Pod 已读到 ConfigMap。
+        </p>
         <ul>
+          <li><strong>FATAL: Web Risk rejected the request</strong> — Key 无效、被 API restrictions 挡住，或 Web Risk API 没启用。整轮以 <code>2</code> 退出，一个域名都没查。</li>
+          <li><strong>ERROR: WEBRISK_API_KEY not configured</strong> — Secret <code>portal-monitor-webrisk</code> 不存在或 key 名不是 <code>api-key</code>。</li>
           <li><strong>UNSAFE 且 No status change</strong> — 检测成功，只是不重复告警。</li>
-          <li><strong>UNKNOWN + timed out waiting</strong> — 20s 内没出现已知文案，或文案变了；会写 debug 文件。</li>
-          <li><strong>UNKNOWN 无超时</strong> — Google 明确说无法给简单结论，或短语未匹配。</li>
+          <li><strong>CHECK_ERROR</strong> — 超时 / <code>429</code> / <code>5xx</code>，重试耗尽。上次的有效状态会保留。</li>
+          <li><strong>全部 SAFE 但你确信某页面有问题</strong> — 大概率是 URL 级匹配的问题：清单里写的是裸域名，而被标记的是具体路径。把完整 URL 加进 <code>domains.txt</code>。</li>
         </ul>
+
+        <p>可以先用 curl 绕开整个程序，直接确认 Google 那边怎么答：</p>
+        <pre>curl -s "https://webrisk.googleapis.com/v1/uris:search\
+?threatTypes=MALWARE\
+&amp;threatTypes=SOCIAL_ENGINEERING\
+&amp;threatTypes=UNWANTED_SOFTWARE\
+&amp;uri=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' 'https://例子.com/path')\
+&amp;key=$WEBRISK_API_KEY"</pre>
+        <p class="muted">返回 <code>{}</code> 就是未命中。这一步能把「程序解析错了」和「Google 本来就没标记」区分开。</p>
 
         <p>Pod 已 Completed 时不能 exec。起一个临时 busybox 挂同一 PVC（RWO：等 monitor 结束再挂）：</p>
         <pre>ls -l /data
-cat /data/status.json
-head -c 4000 /data/debug_&lt;域名&gt;.txt</pre>
+cat /data/status.json</pre>
 
         <div class="callout">
           <p>
-            debug 文本就是当时页面的 innerText。
-            若里面已有 <code>Some pages on this site are unsafe</code>，但日志仍是 UNKNOWN，
-            说明解析短语没跟上页面（这类问题已在 <code>UNSAFE_PATTERNS</code> 里补过）。
+            <code>status.json</code> 只有 SAFE / UNSAFE 两种值。
+            某个域名在里面<strong>没有 key</strong>，说明它从来没拿到过有效结论（一直 CHECK_ERROR）。
           </p>
-          <p>修解析必须发新镜像，只改 ConfigMap 不够。</p>
+          <p>
+            删 Job / Pod，不要删 PVC。状态没了下次会当成首次检查，已经是 UNSAFE 的域名会再告一次。
+          </p>
+          <p>改判定逻辑必须发新镜像；只改域名清单 apply ConfigMap 就够。</p>
         </div>
       </section>
     </main>

@@ -4,13 +4,17 @@
   - [Overview](#overview)
     - [Status](#status)
     - [Alert Logic](#alert-logic)
+    - [覆盖范围](#覆盖范围)
+    - [API 错误处理](#api-错误处理)
+    - [配额与计费](#配额与计费)
     - [Project Structure](#project-structure)
   - [1. Local](#1-local)
-    - [1.1 Create Python Environment](#11-create-python-environment)
-    - [1.2 Configure Domains](#12-configure-domains)
-    - [1.3 Teams Webhook](#13-teams-webhook)
-    - [1.4 Test Teams Webhook](#14-test-teams-webhook)
-    - [1.5 Local Run](#15-local-run)
+    - [1.1 Python](#11-python)
+    - [1.2 Web Risk API Key](#12-web-risk-api-key)
+    - [1.3 Configure Domains](#13-configure-domains)
+    - [1.4 Teams Webhook](#14-teams-webhook)
+    - [1.5 Test Teams Webhook](#15-test-teams-webhook)
+    - [1.6 Local Run](#16-local-run)
   - [2. Docker](#2-docker)
     - [2.1 Build and Push](#21-build-and-push)
     - [2.2 Image Version](#22-image-version)
@@ -21,7 +25,7 @@
     - [3.4 Production PVC](#34-production-pvc)
     - [3.5 Test PVC](#35-test-pvc)
     - [3.6 ConfigMap](#36-configmap)
-    - [3.7 Teams Secret](#37-teams-secret)
+    - [3.7 Secrets](#37-secrets)
     - [3.8 Test Job](#38-test-job)
     - [3.9 Production CronJob](#39-production-cronjob)
     - [3.10 Manual Trigger CronJob](#310-manual-trigger-cronjob)
@@ -29,27 +33,26 @@
     - [3.12 Debug PVC](#312-debug-pvc)
       - [Debug Production PVC](#debug-production-pvc)
       - [Debug Test PVC](#debug-test-pvc)
-    - [3.13 Debug Files](#313-debug-files)
-    - [3.14 Useful Commands](#314-useful-commands)
+    - [3.13 Useful Commands](#313-useful-commands)
   - [4. CI/CD](#4-cicd)
     - [4.1 CI](#41-ci)
     - [4.2 Test CD](#42-test-cd)
     - [4.3 Production CD](#43-production-cd)
-  - [Google Web Risk](#google-web-risk)
+  - [Migration from Transparency Report](#migration-from-transparency-report)
   - [Current Deployment Model](#current-deployment-model)
 
 ---
 
-定时检查 Google Safe Browsing Transparency Report 中配置域名 / URL 的安全状态，并在状态发生变化时通过 Microsoft Teams Workflow Webhook 发送通知。
+定时通过 Google Web Risk Lookup API 检查配置域名 / URL 的安全状态，并在状态发生变化时通过 Microsoft Teams Workflow Webhook 发送通知。
 
 当前运行方式：
 
 ```text
-Google Transparency Report
+Google Web Risk Lookup API
         ↓
-Python + Playwright
+Python (standard library)
         ↓
-SAFE / UNSAFE / UNKNOWN / NO_DATA / BLOCKED
+SAFE / UNSAFE
         ↓
 status.json 状态比较
         ↓
@@ -60,7 +63,7 @@ Power Automate Webhook
 Microsoft Teams
 ```
 
-Production 运行在 Kubernetes CronJob 中，每 10 分钟检查一次。
+Production 运行在 Kubernetes CronJob 中，每 6 小时检查一次（每天 4 轮）。
 
 ---
 
@@ -70,24 +73,30 @@ Production 运行在 Kubernetes CronJob 中，每 10 分钟检查一次。
 
 当前支持：
 
-| Status        | Description                       |
-| ------------- | --------------------------------- |
-| `SAFE`        | Google 明确返回安全               |
-| `UNSAFE`      | Google 判定网站或部分页面存在风险 |
-| `UNKNOWN`     | Google 无法明确判断               |
-| `NO_DATA`     | Google 暂无该站点数据             |
-| `BLOCKED`     | Google 返回反爬拦截页，本次无结果 |
-| `CHECK_ERROR` | 页面访问或检测过程异常            |
+| Status        | Description                          |
+| ------------- | ------------------------------------ |
+| `SAFE`        | 该 URI 不在任何被查询的威胁列表中    |
+| `UNSAFE`      | 该 URI 命中至少一个威胁列表          |
+| `CHECK_ERROR` | API 调用异常（超时、429、5xx）       |
 
-支持识别的 UNSAFE 页面结果包括：
+Lookup API 的响应只有两种形态。空对象表示未命中：
 
-```text
-This site is unsafe
-Some pages on this site are unsafe
-Contains harmful content
+```json
+{}
 ```
 
-已使用 Google Safe Browsing 测试 URL 验证：
+命中时返回威胁类型与缓存过期时间：
+
+```json
+{
+  "threat": {
+    "threatTypes": ["MALWARE"],
+    "expireTime": "2026-09-18T15:01:23.045123456Z"
+  }
+}
+```
+
+默认查询的威胁列表，可用 `THREAT_TYPES` 覆盖：
 
 ```text
 MALWARE
@@ -95,11 +104,7 @@ SOCIAL_ENGINEERING
 UNWANTED_SOFTWARE
 ```
 
-当前统一识别为：
-
-```text
-UNSAFE
-```
+命中任意一个都统一记为 `UNSAFE`，具体类型只写入日志，不进入 Webhook 负载。
 
 ---
 
@@ -140,61 +145,61 @@ SAFE → SAFE
 → 不通知
 ```
 
-`UNKNOWN / NO_DATA / BLOCKED / CHECK_ERROR` 不覆盖之前已经存在的有效 `SAFE / UNSAFE` 状态。
+`CHECK_ERROR` 不覆盖之前已经存在的有效 `SAFE / UNSAFE` 状态。
 
 ---
 
-### Google 反爬拦截
+### 覆盖范围
 
-Transparency Report 不是公开 API，Google 会按出口 IP 和浏览器指纹限流。被判定为自动化请求时，页面会跳转到 `www.google.com/sorry/index`：
+Lookup API 是 **URL 级**查询，不是整站判定。
 
-```text
-Our systems have detected unusual traffic from your computer network.
-```
-
-该页面不含任何 `SAFE / UNSAFE` 关键词，因此单独识别为 `BLOCKED`，避免被误判成 `UNKNOWN` 后静默沿用旧状态、让监控在无声中失明。
-
-`BLOCKED` 的处理与 `UNKNOWN` 不同：
+Web Risk 会对传入 URI 展开若干 host 后缀与 path 前缀组合再比对，因此整个域名被列入名单时，查任意路径都会命中。但如果只有某个具体页面被标记，查首页**不会**命中：
 
 ```text
-BLOCKED
-    ↓
-Teams Alert (monitor_blocked)
-    ↓
-保留上一次有效状态
-    ↓
-FAIL_ON_ERROR=true 时进程非 0 退出
+https://example.com/            → SAFE
+https://example.com/bad/page    → UNSAFE
 ```
 
-Webhook 负载与 `status_changed` 字段结构一致，仅 `event` 不同，Power Automate 可用同一套 schema 解析：
+这与之前 Transparency Report 的站点级判定（`Some pages on this site are unsafe`）不同，覆盖面更窄。需要盯具体路径时，在 `domains.txt` 里直接写完整 URL。
 
-```json
-{
-  "event": "monitor_blocked",
-  "domain": "portal-test.example.com",
-  "previous": "SAFE",
-  "current": "BLOCKED",
-  "time": "2026-08-21T09:00:00+08:00"
-}
-```
+---
 
-识别方式有两处，任一命中即判定 `BLOCKED`：
+### API 错误处理
+
+`400 / 401 / 403` 表示 key 无效或 Web Risk API 未启用。重试无意义，且剩余域名会以同样方式失败，因此立即中止整轮并以 `2` 退出：
 
 ```text
-1. 跳转后的 URL 包含 /sorry/
-2. 页面文本包含 unusual traffic from your computer network
+FATAL: Web Risk rejected the request (HTTP 400).
+Check WEBRISK_API_KEY and that the Web Risk API is enabled.
 ```
 
-降低触发概率的配置，均在 `k8s/cronjob.yaml` 与 `k8s/test-job.yaml` 中设置：
+其余异常（超时、`429`、`5xx`）按 `MAX_RETRIES` 重试，仍失败则该域名记为 `CHECK_ERROR`，保留上一次有效状态，并在 `FAIL_ON_ERROR=true` 时让进程非 0 退出。
+
+---
+
+### 配额与计费
+
+Lookup API `uris.search` 每月前 100,000 次免费，之后 $0.50 / 1,000 次。
+
+当前 `schedule` 为每 6 小时一轮（每天 4 次），单个域名每月约 120 次：
 
 ```text
-CONCURRENCY=1              并发浏览器共用集群出口 IP，是主要诱因
-DOMAIN_DELAY_SECONDS       域名之间的抖动间隔，避免整轮呈现为突发请求
-BLOCKED_BACKOFF_SECONDS    被拦后指数退避，而非 2 秒硬重试
-USER_AGENT                 覆盖 Playwright Chromium 自带的 HeadlessChrome UA
+每天 4 轮 × 145 域名  ≈  17,400 次/月   免费
 ```
 
-这些只能降低概率。机房 / 共享 NAT 出口 IP 长期仍会被拦，根治方案是改用官方 Safe Browsing Lookup API，或为 Pod 分配独立 egress IP。
+免费额度下这个频率可以撑到约 **833 个域名**，现有清单有充足余量。
+
+供对照，更高频率的成本：
+
+```text
+10 分钟一轮 ×  23 域名  ≈  99,360 次/月   免费
+10 分钟一轮 × 145 域名  ≈ 626,400 次/月   约 $263/月
+60 分钟一轮 × 145 域名  ≈ 104,400 次/月   约 $2/月
+```
+
+域名清单较大时，用 `schedule` 降频比其他优化都有效。
+
+注意：一旦调用 Update API 的 `threatLists.computeDiff`，`uris.search` 的单价会跳到 $50 / 1,000 次。本项目只使用纯 Lookup REST 调用，不要引入本地威胁库同步。
 
 ---
 
@@ -230,8 +235,6 @@ Runtime 文件不要提交 Git：
 
 ```text
 status.json
-debug_*.txt
-debug_*.png
 docker-state/
 .venv/
 .env
@@ -241,24 +244,83 @@ docker-state/
 
 ## 1. Local
 
-### 1.1 Create Python Environment
+### 1.1 Python
+
+Monitor 只依赖标准库，`requirements.txt` 为空，不需要 venv，也不需要安装任何包。
+
+确认版本（3.9+）：
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python3 --version
 ```
 
-安装：
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-Local macOS 使用本机 Google Chrome。
+macOS 没有 `python` 这个命令，只有 `python3`。本文所有命令都用 `python3`。
 
 ---
 
-### 1.2 Configure Domains
+### 1.2 Web Risk API Key
+
+前置条件：
+
+```text
+Google Cloud Project
+启用 Web Risk API
+创建 API Key
+```
+
+启用 API：
+
+```text
+Google Cloud Console → APIs & Services → Library → Web Risk API → Enable
+```
+
+创建 Key：
+
+```text
+APIs & Services → Credentials → Create credentials → API key
+```
+
+服务端调用不带 Referer / Origin，所以 Application restrictions 保持 `None`，改用 API restrictions 把 key 限定到 Web Risk：
+
+```text
+API restrictions → Restrict key → Web Risk API
+```
+
+设置：
+
+```bash
+export WEBRISK_API_KEY='YOUR_API_KEY'
+```
+
+验证 key 可用（已知的恶意测试 URL，应返回威胁）：
+
+```bash
+curl -s "https://webrisk.googleapis.com/v1/uris:search?threatTypes=MALWARE&uri=http%3A%2F%2Ftestsafebrowsing.appspot.com%2Fs%2Fmalware.html&key=$WEBRISK_API_KEY"
+```
+
+正常：
+
+```json
+{"threat":{"threatTypes":["MALWARE"],"expireTime":"..."}}
+```
+
+对照组（干净站点，应返回空对象）：
+
+```bash
+curl -s "https://webrisk.googleapis.com/v1/uris:search?threatTypes=MALWARE&uri=https%3A%2F%2Fwww.google.com%2F&key=$WEBRISK_API_KEY"
+```
+
+正常：
+
+```json
+{}
+```
+
+不要输出或提交完整 API Key。
+
+---
+
+### 1.3 Configure Domains
 
 编辑：
 
@@ -274,11 +336,14 @@ bilibili.com
 www.baidu.com
 ```
 
-也支持具体 URL/path：
+裸域名会自动补成 `https://<domain>`。也支持直接写完整 URL 或 host/path：
 
 ```text
-testsafebrowsing.appspot.com/apiv4/ANY_PLATFORM/MALWARE/URL/
+https://portal.boruxa.com/login
+testsafebrowsing.appspot.com/s/malware.html
 ```
+
+由于 Lookup API 是 URL 级匹配（见 [覆盖范围](#覆盖范围)），需要盯特定页面时必须把完整路径写进来。
 
 一行一个。
 
@@ -294,7 +359,7 @@ testsafebrowsing.appspot.com/apiv4/ANY_PLATFORM/MALWARE/URL/
 
 ---
 
-### 1.3 Teams Webhook
+### 1.4 Teams Webhook
 
 Teams / Power Automate Workflow：
 
@@ -344,7 +409,7 @@ query keys: ['api-version', 'sp', 'sv', 'sig']
 
 ---
 
-### 1.4 Test Teams Webhook
+### 1.5 Test Teams Webhook
 
 ```bash
 curl -i -X POST "$ALERT_WEBHOOK_URL" \
@@ -376,39 +441,48 @@ Current: UNSAFE
 
 ---
 
-### 1.5 Local Run
+### 1.6 Local Run
 
-如果公司 Zero Trust 导致 Python Webhook SSL verification error，本地测试可临时：
+如果公司 Zero Trust 导致 SSL verification error，本地测试可临时关闭校验。Webhook 与 Web Risk 是两个独立开关：
 
 ```bash
 export WEBHOOK_VERIFY_TLS=false
+export LOOKUP_VERIFY_TLS=false
 ```
 
 运行：
 
 ```bash
-python app/monitor.py
+python3 app/monitor.py
 ```
 
 正常示例：
 
 ```text
 Checking: portal.boruxa.com
+Lookup URI: https://portal.boruxa.com
+Attempt 1/3
 
-Previous: UNSAFE
-Current : UNSAFE
+Previous: SAFE
+Current : SAFE
 
+✅ SAFE: portal.boruxa.com
 No status change.
 ```
 
 首次发现 UNSAFE：
 
 ```text
+Checking: testsafebrowsing.appspot.com/s/malware.html
+Lookup URI: https://testsafebrowsing.appspot.com/s/malware.html
+Attempt 1/3
+Threat types: MALWARE
+
 Previous: (first check)
 Current : UNSAFE
 
-UNSAFE: portal.boruxa.com
-FIRST CHECK AND UNSAFE
+🚨 UNSAFE: testsafebrowsing.appspot.com/s/malware.html
+🚨 FIRST CHECK AND UNSAFE
 
 Webhook HTTP: 202
 ```
@@ -509,6 +583,8 @@ portal-monitor
 │       └── domains.txt
 │
 ├── Secret
+│   ├── portal-monitor-webrisk
+│   │   └── Web Risk API Key
 │   └── portal-monitor-alert
 │       └── Teams Webhook
 │
@@ -693,17 +769,24 @@ kubectl apply -f k8s/configmap.yaml
 
 ---
 
-### 3.7 Teams Secret
+### 3.7 Secrets
 
-本地：
+需要两个 Secret。
+
+Web Risk API Key：
+
+```bash
+export WEBRISK_API_KEY='YOUR_API_KEY'
+
+kubectl create secret generic portal-monitor-webrisk \
+  --from-literal=api-key="$WEBRISK_API_KEY"
+```
+
+Teams Webhook：
 
 ```bash
 export ALERT_WEBHOOK_URL='YOUR_WEBHOOK_URL'
-```
 
-创建：
-
-```bash
 kubectl create secret generic portal-monitor-alert \
   --from-literal=webhook-url="$ALERT_WEBHOOK_URL"
 ```
@@ -711,10 +794,20 @@ kubectl create secret generic portal-monitor-alert \
 确认：
 
 ```bash
-kubectl get secret portal-monitor-alert
+kubectl get secret portal-monitor-webrisk portal-monitor-alert
 ```
 
-不要把 Webhook URL 提交到 Git。
+轮换 API Key：
+
+```bash
+kubectl create secret generic portal-monitor-webrisk \
+  --from-literal=api-key="$WEBRISK_API_KEY" \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+下一轮 CronJob 自动生效，不需要重新部署。
+
+不要把 API Key 或 Webhook URL 提交到 Git。
 
 ---
 
@@ -750,7 +843,7 @@ STATUS: Complete
 
 镜像由 CD 写入 `IMAGE_PLACEHOLDER`。不要直接 `kubectl apply -f k8s/test-job.yaml`。
 
-测试 Job 设置了 `FAIL_ON_ERROR=true`：`CHECK_ERROR`、`BLOCKED` 或 Webhook 失败时进程非 0 退出，Job 被标记为 Failed。
+测试 Job 设置了 `FAIL_ON_ERROR=true`：`CHECK_ERROR` 或 Webhook 失败时进程非 0 退出，Job 被标记为 Failed。API Key 无效会直接以 `2` 退出。
 
 CD 是一次性部署，只等待 Pod 启动（3 分钟），不等待 Job 跑完，因此**不会**因为 Job 失败而失败。Job 的最终结果需要自行查看：
 
@@ -759,7 +852,7 @@ kubectl get job portal-monitor-test -n portal-monitor
 kubectl logs -f -n portal-monitor job/portal-monitor-test
 ```
 
-`kubectl get job` 的 `DURATION` 列即本次跑完耗时。`activeDeadlineSeconds` 为 28800（8 小时），域名清单较大时留足余量。
+`kubectl get job` 的 `DURATION` 列即本次跑完耗时。改用 Lookup API 后一轮只有 HTTP 调用，`activeDeadlineSeconds` 已从 28800 降到 600。
 
 ---
 
@@ -770,7 +863,8 @@ Production：
 ```text
 Image: v1.x.x
 PVC: portal-monitor-state
-Schedule: every 10 minutes
+Schedule: every 6 hours (4 runs per day)
+Time zone: Asia/Shanghai
 ```
 
 查看：
@@ -781,22 +875,33 @@ kubectl get cronjob portal-monitor
 
 当前 Schedule：
 
-```text
-*/10 * * * *
+```yaml
+schedule: "0 */6 * * *"
+timeZone: Asia/Shanghai
 ```
 
-即：
+即北京时间：
 
 ```text
-00
-10
-20
-30
-40
-50
+00:00   06:00   12:00   18:00
 ```
 
-分钟执行。
+CronJob 默认按 UTC 执行，`spec.timeZone` 自 Kubernetes 1.27 起为正式特性。确认生效：
+
+```bash
+kubectl get cronjob portal-monitor \
+  -o jsonpath='{.spec.timeZone}'; echo
+```
+
+应返回：
+
+```text
+Asia/Shanghai
+```
+
+如果返回为空，说明字段被 API Server 丢弃（集群低于 1.27），此时实际仍按 UTC 跑，需要改回 `0 16,22,4,10 * * *` 之类的 UTC 表达式。
+
+检测延迟的上限即一个周期，也就是最坏情况下域名被标记 6 小时后才告警。
 
 镜像由 `cd-cronjob.yml` 把 `IMAGE_PLACEHOLDER` 换成 `v1.x.x` 后 apply。不要直接 `kubectl apply -f k8s/cronjob.yaml`。
 
@@ -947,15 +1052,6 @@ ls -lah /data
 cat /data/status.json
 ```
 
-可能还会看到：
-
-```text
-debug_bilibili.com.txt
-debug_bilibili.com.png
-debug_www.baidu.com.txt
-debug_www.baidu.com.png
-```
-
 退出：
 
 ```sh
@@ -1006,29 +1102,7 @@ cat /data/status.json
 
 ---
 
-### 3.13 Debug Files
-
-当 Google 页面无法得到明确状态时，Monitor 会保存 Debug 信息：
-
-```text
-/data/debug_<domain>.txt
-/data/debug_<domain>.png
-```
-
-例如：
-
-```text
-/data/debug_bilibili.com.txt
-/data/debug_bilibili.com.png
-```
-
-用于确认 Google Transparency Report 实际返回的页面内容。
-
-这些文件只用于排查，不应提交 Git。
-
----
-
-### 3.14 Useful Commands
+### 3.13 Useful Commands
 
 查看 Pod：
 
@@ -1192,33 +1266,33 @@ lifebytehub/portal-monitor:v1.0.0
 
 ---
 
-## Google Web Risk
+## Migration from Transparency Report
 
-最初方案也考虑直接使用 Google Web Risk API。
+早期 POC 抓取公开的 Google Safe Browsing Transparency Report 页面（Playwright + Chromium）。Transparency Report 不是公开 API，Google 会按出口 IP 和浏览器指纹限流，机房 / 共享 NAT 出口长期会被判定为自动化流量并跳转 `/sorry/index`，监控因此需要一个 `BLOCKED` 状态来避免静默失明。降并发、加抖动间隔、伪装 UA 只能降低概率，无法根治。
 
-Web Risk 可以直接进行 URL threat checking，但依赖：
+改用 Web Risk Lookup API 后：
 
-```text
-Google Cloud Project
-Google Cloud API
-Credential / IAM
+| 项目             | Transparency Report                            | Web Risk Lookup API           |
+| ---------------- | ---------------------------------------------- | ----------------------------- |
+| 判定粒度         | 站点级                                         | URL 级                        |
+| 反爬拦截         | 长期存在，需 `BLOCKED` 状态                    | 无                            |
+| 状态枚举         | SAFE / UNSAFE / UNKNOWN / NO_DATA / BLOCKED    | SAFE / UNSAFE                 |
+| 运行时依赖       | Playwright + Chromium                          | 标准库                        |
+| 镜像体积         | 约 1.8 GB                                      | 约 160 MB                     |
+| 单域名耗时       | 数秒至数十秒                                   | 一次 HTTP 调用                |
+| 凭证             | 无                                             | GCP Project + API Key         |
+| 成本             | 免费                                           | 每月 10 万次内免费            |
+
+保持不变的部分：`domains.txt` 格式、`status.json` 状态比较、Teams Webhook 负载结构、`FAIL_ON_ERROR` 语义、K8s 编排与 CI/CD 流程。
+
+`BLOCKED` 从未写入 `status.json`（命中时保留 previous），因此存量状态文件无需清理，Power Automate 侧也不用改 schema。
+
+需要回退时不必改代码，把 CronJob 的 image 指回 Transparency Report 版本的 tag 即可：
+
+```bash
+kubectl get cronjob portal-monitor \
+  -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].image}'; echo
 ```
-
-当前环境没有对应 Google Cloud 配置，因此目前 POC 使用公开的：
-
-```text
-Google Safe Browsing Transparency Report
-```
-
-配合：
-
-```text
-Python + Playwright + Chromium
-```
-
-进行检测。
-
-后续如果具备 Google Cloud 条件，可再评估切换至 Web Risk API。
 
 ---
 
@@ -1253,9 +1327,9 @@ Docker Hub :sha-xxxxxxx
           ↓
  Production CronJob
           ↓
- Every 10 Minutes
+  Every 6 Hours
           ↓
- Google Transparency Report
+ Google Web Risk Lookup API
           ↓
       Status Change
           ↓
