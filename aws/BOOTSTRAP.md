@@ -134,7 +134,7 @@ aws s3 cp domains.txt \
 
 改域名以后只重新 `aws s3 cp`，不用重新部署 Lambda。
 
-评估期建议先用少量域名（或测试 URL），不要一口气上百个。
+域名数量直接影响 Web Risk 调用次数（默认定时每天 4 次 × 域名数）；上线前请对照 GCP 配额，不必一次上传生产全量清单。
 
 ---
 
@@ -147,7 +147,7 @@ aws s3 cp domains.txt \
 | `AWS_DEPLOY_ROLE_ARN` | bootstrap 输出的 `DeployRoleArn` |
 | `AWS_STATE_BUCKET` | bootstrap 输出的 `StateBucketName` |
 | `WEBRISK_API_KEY` | GCP Web Risk API Key |
-| `ALERT_WEBHOOK_URL` | Teams Webhook（评估期可先不填；`enable_webhook=false` 时不用） |
+| `ALERT_WEBHOOK_URL` | Teams Webhook；仅当 CD 里 `enable_webhook=true` 时需要 |
 
 Region 写在 workflow 的 `env.AWS_REGION`，不是 Secret。
 
@@ -163,8 +163,8 @@ Actions → **CD - Deploy Lambda** → Run workflow：
 
 ```text
 Use workflow from   main                # 决定 OIDC sub，须匹配 GitHubRefFilter
-ref                 feat/web-risk-api   # 决定打包哪份代码，与上面无关
-enable_webhook      false               # 评估期务必 false，避免和 K8s 双份告警
+ref                 main                # 决定打包哪份代码，与上面无关
+enable_webhook      false / true        # false=只查不写 Teams；true 需 ALERT_WEBHOOK_URL
 ```
 
 这两个 ref 是不同的东西：下拉框选的分支决定 OIDC token 里的 `sub`（须匹配 bootstrap 的 `GitHubRefFilter`），而 `ref` 输入只交给 `actions/checkout` 决定打进 zip 的是哪个版本的 `monitor.py`。选错下拉框会在假扮 Role 那步报 `Not authorized to perform sts:AssumeRoleWithWebIdentity`。
@@ -197,9 +197,9 @@ aws s3 cp "s3://${STATE_BUCKET}/portal-monitor/status.json" - --region "$AWS_REG
 - [ ] bootstrap Stack 成功，Deploy Role ARN 已写入 Secrets
 - [ ] `s3://…/portal-monitor/domains.txt` 存在
 - [ ] Web Risk curl 能命中测试恶意 URL
-- [ ] `CD - Deploy Lambda` 冒烟 invoke 成功（无 key 时预期失败，见第 4 节）
-- [ ] `enable_webhook=false`（评估期）
-- [ ] EventBridge Schedule 时区是 `Asia/Shanghai`，表达式每天 4 次
+- [ ] `CD - Deploy Lambda` 冒烟 invoke 成功（无有效 key 时预期失败，见第 4 节）
+- [ ] 若需要 Teams：`enable_webhook=true` 且已配置 `ALERT_WEBHOOK_URL`
+- [ ] EventBridge Schedule 时区是 `Asia/Shanghai`，表达式每天 4 次；上线前 `State` 为 `ENABLED`
 
 确认 Schedule：
 
@@ -244,7 +244,8 @@ aws cloudformation deploy \
 | Invoke 报 `HeadObject` / `403 Forbidden` 在拉 `status.json` | 首次运行没有 state 文件；若 Lambda 角色缺 `s3:ListBucket`（旧 template）也会 403 而非 404——更新 `aws/template.yaml` 后重跑 CD |
 | Invoke 报 `domains file not found` | 没上传 `domains.txt` |
 | Invoke 报 `HTTP 403` / `SERVICE_DISABLED` | GCP 开的是 Safe Browsing，不是 Web Risk；或没绑计费 |
-| Invoke 报 `WEBRISK_API_KEY not configured` | GitHub secret `WEBRISK_API_KEY` 为空 |
+| Invoke 报 `WEBRISK_API_KEY not configured` | 未配置 secret 或 Lambda 环境变量为空（GitHub 不能存空 secret） |
+| Invoke 报 `API_KEY_INVALID` | 占位或非 Web Risk 的 key；需在 GCP 启用 Web Risk 并使用有效 API key |
 | `BucketAlreadyExists` | Bucket 名被别的账号占用，换一个后缀 |
 | bootstrap 报 `AccessDenied` 且提到 SCP | Org 层 SCP 拦住了 `iam:CreateRole` 或显式 `RoleName`，需找 Org 管理员 |
 
@@ -300,6 +301,16 @@ aws logs describe-log-groups --log-group-name-prefix /aws/lambda/portal-monitor 
 ```
 
 共享的 GitHub OIDC Provider 不在拆除范围内，始终由 Terraform 持有。
+
+---
+
+## 8. 注意事项
+
+1. **独立部署**：本路线只依赖 `972910065688` 账号内的 S3、Lambda、EventBridge、IAM；与 EKS / CronJob 无耦合。勿在同一批域名上同时开 Lambda Schedule 与 K8s CronJob 且都发 Teams。
+2. **OIDC**：从 **`main`** Run workflow；信任策略需匹配 GitHub 新 `sub`（`repo:org@ID/repo@ID:…`），见 §1 模板。
+3. **Web Risk**：Secret 须非空才有 key；invoke 成功后再把 Schedule 设为 **ENABLED**。
+4. **Secrets 必填（CD）**：`AWS_DEPLOY_ROLE_ARN`、`AWS_STATE_BUCKET`；`WEBRISK_API_KEY`、`ALERT_WEBHOOK_URL` 按 §3、§4 按需。
+5. **清理**：见 §7；bootstrap 桶 Retain，OIDC Provider 勿删（Terraform 共用）。
 
 ---
 

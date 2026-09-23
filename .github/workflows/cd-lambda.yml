@@ -10,8 +10,8 @@ on:
 
       enable_webhook:
         description: >
-          Send Teams alerts. Keep false while evaluating against the
-          K8s CronJob, otherwise both stacks alert on the same change.
+          Send Teams alerts (needs ALERT_WEBHOOK_URL secret). False =
+          check domains and write S3 state only.
         type: boolean
         required: true
         default: false

@@ -26,8 +26,7 @@ Parameters:
     Default: ""
     Description: >
       Teams / Power Automate webhook. Leave empty to check and
-      record state without notifying, which is what the parallel
-      evaluation against the K8s CronJob should use.
+      record state in S3 without sending notifications.
 
   ScheduleExpression:
     Type: String
