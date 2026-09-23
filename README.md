@@ -16,8 +16,9 @@
     - [1.5 Test Teams Webhook](#15-test-teams-webhook)
     - [1.6 Local Run](#16-local-run)
   - [2. Docker](#2-docker)
-    - [2.1 Build and Push](#21-build-and-push)
-    - [2.2 Image Version](#22-image-version)
+    - [2.1 Run](#21-run)
+    - [2.2 Build and Push](#22-build-and-push)
+    - [2.3 Image Version](#23-image-version)
   - [3. Kubernetes](#3-kubernetes)
     - [3.1 Architecture](#31-architecture)
     - [3.2 Namespace](#32-namespace)
@@ -38,6 +39,13 @@
     - [4.1 CI](#41-ci)
     - [4.2 Test CD](#42-test-cd)
     - [4.3 Production CD](#43-production-cd)
+  - [5. AWS Lambda（评估中）](#5-aws-lambda评估中)
+    - [5.1 与 K8s 的差异](#51-与-k8s-的差异)
+    - [5.2 一次性准备（底座）](#52-一次性准备底座)
+    - [5.3 部署](#53-部署)
+    - [5.4 评估期不要双份告警](#54-评估期不要双份告警)
+    - [5.5 运维](#55-运维)
+    - [5.6 淘汰另一条路线时](#56-淘汰另一条路线时)
   - [Migration from Transparency Report](#migration-from-transparency-report)
   - [Current Deployment Model](#current-deployment-model)
 
@@ -211,7 +219,8 @@ portal-monitor/
 │   └── workflows/
 │       ├── docker-publish.yml
 │       ├── cd-test-job.yml
-│       └── cd-cronjob.yml
+│       ├── cd-cronjob.yml
+│       └── cd-lambda.yml
 │
 ├── app/
 │   └── monitor.py
@@ -225,11 +234,19 @@ portal-monitor/
 │   ├── test-job.yaml
 │   └── cronjob.yaml
 │
+├── aws/
+│   ├── BOOTSTRAP.md
+│   ├── bootstrap.yaml
+│   ├── lambda_handler.py
+│   └── template.yaml
+│
 ├── Dockerfile
 ├── requirements.txt
 ├── domains.txt
 └── README.md
 ```
+
+`app/monitor.py` 是两种部署方式共用的唯一业务代码。`k8s/` 和 `aws/` 分别是两条承载路线，评估后保留一条。Lambda 那条先看 `aws/BOOTSTRAP.md`。
 
 Runtime 文件不要提交 Git：
 
@@ -497,7 +514,77 @@ status.json
 
 ## 2. Docker
 
-### 2.1 Build and Push
+### 2.1 Run
+
+镜像里已经 `COPY` 了一份 `domains.txt`，状态默认写在容器内的 `/data/status.json`。容器删掉状态就没了，所以要把 `/data` 挂到宿主机，否则每次都是「首次检查」，已经是 UNSAFE 的域名会重复告警。
+
+拉镜像：
+
+```bash
+docker pull lifebytehub/portal-monitor:v1.0.0
+```
+
+运行：
+
+```bash
+mkdir -p docker-state
+
+docker run --rm \
+  -v "$PWD/docker-state:/data" \
+  -e WEBRISK_API_KEY="$WEBRISK_API_KEY" \
+  -e ALERT_WEBHOOK_URL="$ALERT_WEBHOOK_URL" \
+  lifebytehub/portal-monitor:v1.0.0
+```
+
+状态落在：
+
+```text
+docker-state/status.json
+```
+
+用本地的域名清单覆盖镜像里那份：
+
+```bash
+docker run --rm \
+  -v "$PWD/docker-state:/data" \
+  -v "$PWD/domains.txt:/app/domains.txt:ro" \
+  -e WEBRISK_API_KEY="$WEBRISK_API_KEY" \
+  -e ALERT_WEBHOOK_URL="$ALERT_WEBHOOK_URL" \
+  lifebytehub/portal-monitor:v1.0.0
+```
+
+只检查、不发通知（不传 `ALERT_WEBHOOK_URL` 即可）：
+
+```bash
+docker run --rm \
+  -v "$PWD/docker-state:/data" \
+  -e WEBRISK_API_KEY="$WEBRISK_API_KEY" \
+  lifebytehub/portal-monitor:v1.0.0
+```
+
+公司 Zero Trust 做 TLS 检查导致证书校验失败时，可临时关掉。两个开关分别对应 Web Risk 和 Webhook，不要当生产默认：
+
+```bash
+docker run --rm \
+  -v "$PWD/docker-state:/data" \
+  -e WEBRISK_API_KEY="$WEBRISK_API_KEY" \
+  -e ALERT_WEBHOOK_URL="$ALERT_WEBHOOK_URL" \
+  -e LOOKUP_VERIFY_TLS=false \
+  -e WEBHOOK_VERIFY_TLS=false \
+  lifebytehub/portal-monitor:v1.0.0
+```
+
+查看状态：
+
+```bash
+cat docker-state/status.json
+```
+
+`docker-state/` 不要提交 Git。
+
+---
+
+### 2.2 Build and Push
 
 Build：
 
@@ -528,7 +615,7 @@ lifebytehub/portal-monitor
 
 ---
 
-### 2.2 Image Version
+### 2.3 Image Version
 
 开发提交使用 Git SHA：
 
@@ -1263,6 +1350,179 @@ kubectl get cronjob portal-monitor \
 ```text
 lifebytehub/portal-monitor:v1.0.0
 ```
+
+---
+
+## 5. AWS Lambda（评估中）
+
+Lambda 是与 Kubernetes CronJob **并行**的第二种部署方式，用于评估后择一保留。两者跑同一份 `app/monitor.py`，代码零差异。
+
+### 5.1 与 K8s 的差异
+
+承载方式不同的地方只有三处：
+
+| | Kubernetes CronJob | AWS Lambda |
+| --- | --- | --- |
+| 打包 | Docker 镜像（Docker Hub） | zip 部署包，约 8 KB |
+| 状态 | PVC `/data/status.json` | S3 `portal-monitor/status.json` |
+| 域名清单 | ConfigMap | S3 `portal-monitor/domains.txt` |
+| 定时 | CronJob `spec.timeZone` | EventBridge Scheduler `ScheduleExpressionTimezone` |
+| 部署 | `cd-cronjob.yml` | `cd-lambda.yml` |
+
+`monitor.py` 只认环境变量和文件路径，对自己跑在哪里无感知。Lambda 侧的差异全部由 `aws/lambda_handler.py` 吸收：
+
+```text
+S3 → /tmp → monitor.main() → /tmp → S3
+```
+
+Lambda 没有持久化磁盘，`/tmp` 跨调用不保证保留。handler 每轮从 S3 拉状态、跑完传回，并在 S3 上没有状态时清掉 `/tmp` 里可能残留的旧文件（warm container 复用会留下上一次的 `status.json`）。
+
+Lambda 路线不需要 Docker Hub。`monitor.py` 无第三方依赖，`boto3` 由运行时自带，所以部署包只有两个文件。
+
+---
+
+### 5.2 一次性准备（底座）
+
+目标账号是 `LB-INFRA-PROD-972910065688`，Region `ap-east-1`——与现有 CronJob 所在的 EKS 集群同 Region。不要手搓 IAM / Bucket，用 bootstrap Stack 一次建好底座，再跑日常 CD：
+
+完整步骤见 **[aws/BOOTSTRAP.md](aws/BOOTSTRAP.md)**。摘要：
+
+```text
+1. aws cloudformation deploy  aws/bootstrap.yaml
+      → S3 Bucket
+      → IAM Role portal-monitor-github-deploy
+      （GitHub OIDC Provider 复用账号现有的，不重建）
+
+2. 上传 domains.txt 到 Bucket
+3. 填 GitHub Secrets（Role ARN / Bucket / Web Risk Key / Webhook）
+4. Actions → CD - Deploy Lambda（enable_webhook=false）
+```
+
+```bash
+export AWS_PROFILE=LB-INFRA-PROD-972910065688
+export AWS_REGION=ap-east-1
+export STATE_BUCKET="portal-monitor-infra-972910065688"
+
+aws cloudformation deploy \
+  --region "$AWS_REGION" \
+  --stack-name portal-monitor-bootstrap \
+  --template-file aws/bootstrap.yaml \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+    StateBucketName="$STATE_BUCKET" \
+    GitHubOrg=jevinwang-lb \
+    GitHubRepo=portal-monitor-local
+```
+
+两个参数都用模板默认值：`CreateOidcProvider=false` 复用账号现有的 Terraform 托管 Provider，`GitHubRefFilter=ref:refs/heads/main` 限定只有从 `main` dispatch 的 run 能假扮 Deploy Role。部署哪个分支的代码由 workflow 的 `ref` 输入控制，跟这个过滤器无关。
+
+改域名只重新 `aws s3 cp domains.txt s3://$STATE_BUCKET/portal-monitor/domains.txt`，不用重新部署，与 ConfigMap 的用法对应。
+
+---
+
+### 5.3 部署
+
+Actions → **CD - Deploy Lambda** → Run workflow：
+
+```text
+ref              分支 / tag / SHA
+enable_webhook   是否发 Teams 告警
+```
+
+Workflow 依次做：打包 zip → 上传 S3 → `aws cloudformation deploy` → 等待函数更新 → 执行一次冒烟调用并打印日志。
+
+Stack 由 `aws/template.yaml` 定义，包含 Lambda、执行角色、日志组、EventBridge Scheduler 及其调用角色。调度默认：
+
+```yaml
+ScheduleExpression: cron(0 0,6,12,18 * * ? *)
+ScheduleExpressionTimezone: Asia/Shanghai
+```
+
+与 CronJob 一致，即北京时间 00:00 / 06:00 / 12:00 / 18:00。
+
+---
+
+### 5.4 评估期不要双份告警
+
+两套并行时各有独立状态，同一个域名状态变化会触发两份 Teams 通知。
+
+评估期把 `enable_webhook` 保持 `false`。`monitor.py` 在 `ALERT_WEBHOOK_URL` 未配置时照常检查、照常写状态，只是不发通知：
+
+```text
+INFO: ALERT_WEBHOOK_URL not configured
+```
+
+这样可以拿 Lambda 的结果和 K8s 对照，而不打扰频道。比对两边状态：
+
+```bash
+aws s3 cp "s3://$STATE_BUCKET/portal-monitor/status.json" - | jq -S .
+```
+
+确认切换到 Lambda 后，再用 `enable_webhook=true` 重新部署，并 suspend CronJob：
+
+```bash
+kubectl patch cronjob portal-monitor \
+  -p '{"spec":{"suspend":true}}'
+```
+
+---
+
+### 5.5 运维
+
+看日志：
+
+```bash
+aws logs tail /aws/lambda/portal-monitor --follow
+```
+
+手动跑一次：
+
+```bash
+aws lambda invoke \
+  --function-name portal-monitor \
+  --payload '{}' \
+  --cli-binary-format raw-in-base64-out \
+  response.json && cat response.json
+```
+
+查看状态：
+
+```bash
+aws s3 cp "s3://$STATE_BUCKET/portal-monitor/status.json" -
+```
+
+删除整套：
+
+```bash
+aws cloudformation delete-stack --stack-name portal-monitor
+```
+
+Bucket 不在 Stack 内，不会被一起删掉。
+
+---
+
+### 5.6 淘汰另一条路线时
+
+评估结束后直接删掉不用的那套文件，不要把 workflow 注释起来留在仓库里——注释掉的 YAML 不会被任何人维护，也不会被 CI 验证。需要临时停用时用 GitHub 的 **Disable workflow**（仓库 Actions 页面），不改任何文件，随时可恢复。
+
+选定 Lambda 时可以删除：
+
+```text
+k8s/
+Dockerfile
+.github/workflows/docker-publish.yml
+.github/workflows/cd-test-job.yml
+.github/workflows/cd-cronjob.yml
+```
+
+选定 Kubernetes 时可以删除：
+
+```text
+aws/
+.github/workflows/cd-lambda.yml
+```
+
+两套 CD 都是 `workflow_dispatch` 手动触发，不点就不会跑，所以评估期不需要额外做什么来防止误触发。
 
 ---
 

@@ -1,0 +1,194 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  Portal Safe Browsing Monitor on Lambda. Runs app/monitor.py on a
+  schedule and keeps status.json in S3.
+
+Parameters:
+  StateBucketName:
+    Type: String
+    Description: >
+      Existing bucket holding domains.txt, status.json and the
+      deployment zip. Created by aws/bootstrap.yaml, see aws/BOOTSTRAP.md.
+
+  CodeS3Key:
+    Type: String
+    Description: Key of the deployment zip, injected by CD.
+
+  WebRiskApiKey:
+    Type: String
+    NoEcho: true
+    Description: Google Web Risk API key.
+
+  AlertWebhookUrl:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >
+      Teams / Power Automate webhook. Leave empty to check and
+      record state without notifying, which is what the parallel
+      evaluation against the K8s CronJob should use.
+
+  ScheduleExpression:
+    Type: String
+    Default: "cron(0 0,6,12,18 * * ? *)"
+    Description: Four runs per day.
+
+  ScheduleTimeZone:
+    Type: String
+    Default: Asia/Shanghai
+
+  # Starts off so a stack without a working WEBRISK_API_KEY does not
+  # fail four times a day. aws cloudformation deploy keeps the existing
+  # value for parameters it is not given, so flipping this once sticks
+  # across later CD runs.
+  ScheduleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues:
+      - ENABLED
+      - DISABLED
+    Description: >
+      Set ENABLED once a real Web Risk key is in place.
+
+  FailOnError:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+
+Conditions:
+  HasWebhook: !Not [!Equals [!Ref AlertWebhookUrl, ""]]
+
+Resources:
+  # ----------------------------------------------------------
+  # Execution role
+  # ----------------------------------------------------------
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+      Policies:
+        - PolicyName: state-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Scoped to the monitor prefix, not the whole bucket.
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub arn:aws:s3:::${StateBucketName}/portal-monitor/*
+
+  # ----------------------------------------------------------
+  # Function
+  # ----------------------------------------------------------
+  MonitorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: portal-monitor
+      Description: Google Web Risk check for configured domains.
+
+      Runtime: python3.13
+      Handler: lambda_handler.handler
+      Role: !GetAtt FunctionRole.Arn
+
+      Code:
+        S3Bucket: !Ref StateBucketName
+        S3Key: !Ref CodeS3Key
+
+      # monitor.py is standard library only; boto3 ships with the
+      # runtime. A run is a few hundred serial HTTP calls at most.
+      MemorySize: 256
+      Timeout: 600
+
+      Environment:
+        Variables:
+          STATE_BUCKET: !Ref StateBucketName
+          WEBRISK_API_KEY: !Ref WebRiskApiKey
+          FAIL_ON_ERROR: !Ref FailOnError
+          ALERT_WEBHOOK_URL: !If
+            - HasWebhook
+            - !Ref AlertWebhookUrl
+            - !Ref AWS::NoValue
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${MonitorFunction}
+      RetentionInDays: 30
+
+  # ----------------------------------------------------------
+  # Schedule
+  # ----------------------------------------------------------
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+      Policies:
+        - PolicyName: invoke-monitor
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt MonitorFunction.Arn
+
+  Schedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: portal-monitor
+      Description: Four Web Risk checks per day.
+
+      State: !Ref ScheduleState
+
+      ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: !Ref ScheduleTimeZone
+
+      # No jitter: the runs should land on the hour.
+      FlexibleTimeWindow:
+        Mode: "OFF"
+
+      Target:
+        Arn: !GetAtt MonitorFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+
+Outputs:
+  FunctionName:
+    Value: !Ref MonitorFunction
+
+  FunctionArn:
+    Value: !GetAtt MonitorFunction.Arn
+
+  StatePath:
+    Value: !Sub s3://${StateBucketName}/portal-monitor/status.json
+
+  DomainsPath:
+    Value: !Sub s3://${StateBucketName}/portal-monitor/domains.txt
+
+  LogsCommand:
+    Value: !Sub aws logs tail /aws/lambda/${MonitorFunction} --follow

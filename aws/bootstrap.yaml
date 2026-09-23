@@ -1,0 +1,251 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  One-time bootstrap for portal-monitor on an empty AWS account.
+  Creates the S3 state bucket and a GitHub Actions OIDC deploy role.
+  Run this once with admin credentials, then use cd-lambda.yml for
+  day-to-day deploys. Does NOT create the Lambda itself.
+
+Parameters:
+  StateBucketName:
+    Type: String
+    Description: >
+      Globally unique S3 bucket name for domains.txt, status.json,
+      and deployment zips. Example: portal-monitor-infra-<account-id>
+
+  GitHubOrg:
+    Type: String
+    Default: jevinwang-lb
+    Description: GitHub org or user that owns the repo.
+
+  GitHubRepo:
+    Type: String
+    Default: portal-monitor-local
+    Description: Repository name.
+
+  # Limit which refs may assume the role. Use "*" only while
+  # bootstrapping; tighten to "refs/heads/main" or "refs/tags/v*"
+  # once the pipeline is stable.
+  GitHubRefFilter:
+    Type: String
+    Default: ref:refs/heads/main
+    Description: >
+      Trailing part of the OIDC sub claim after repo:ORG/REPO:.
+      Defaults to main so an omitted value fails closed rather than
+      trusting every ref. Pass the branch explicitly while testing.
+      Examples: ref:refs/heads/main | ref:refs/tags/v* | *
+
+  CreateOidcProvider:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: >
+      Account 972910065688 already carries a Terraform-managed
+      token.actions.githubusercontent.com provider, so the default
+      reuses it rather than fighting Terraform for ownership. Set
+      true only on an account that has no provider yet.
+
+Conditions:
+  ShouldCreateOidcProvider: !Equals [!Ref CreateOidcProvider, "true"]
+
+Resources:
+  # ----------------------------------------------------------
+  # State + code bucket
+  # ----------------------------------------------------------
+  StateBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref StateBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  # ----------------------------------------------------------
+  # GitHub Actions OIDC
+  # ----------------------------------------------------------
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      # ThumbprintList omitted on purpose: IAM fetches the CA
+      # thumbprint itself, so a pinned value would only rot when
+      # GitHub rotates intermediate CAs.
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: portal-monitor-github-deploy
+      Description: Assumed by GitHub Actions CD - Deploy Lambda
+
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - ShouldCreateOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${GitHubRepo}:${GitHubRefFilter}
+
+      Policies:
+        - PolicyName: portal-monitor-deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # --- CloudFormation ---
+              - Sid: CloudFormationStack
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:ListStackResources
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/portal-monitor/*
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/portal-monitor
+
+              - Sid: CloudFormationValidate
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                Resource: "*"
+
+              # --- IAM roles created by aws/template.yaml ---
+              #
+              # template.yaml leaves RoleName unset, so CloudFormation
+              # names them portal-monitor-<LogicalId>-<random> after the
+              # stack. That prefix is why PassRole needs no wider scope.
+              - Sid: IamManageMonitorRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:PassRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/portal-monitor-*
+
+              # --- Lambda ---
+              - Sid: Lambda
+                Effect: Allow
+                Action:
+                  - lambda:CreateFunction
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:DeleteFunction
+                  - lambda:InvokeFunction
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                  - lambda:ListTags
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                Resource:
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:portal-monitor
+
+              # --- EventBridge Scheduler ---
+              - Sid: Scheduler
+                Effect: Allow
+                Action:
+                  - scheduler:CreateSchedule
+                  - scheduler:UpdateSchedule
+                  - scheduler:GetSchedule
+                  - scheduler:DeleteSchedule
+                  - scheduler:ListTagsForResource
+                  - scheduler:TagResource
+                  - scheduler:UntagResource
+                Resource:
+                  - !Sub arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/portal-monitor
+
+              - Sid: SchedulerList
+                Effect: Allow
+                Action:
+                  - scheduler:ListSchedules
+                Resource: "*"
+
+              # --- Logs ---
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:PutRetentionPolicy
+                  - logs:DescribeLogGroups
+                  - logs:TagResource
+                  - logs:UntagResource
+                  - logs:ListTagsForResource
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/portal-monitor*
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/portal-monitor*:*
+
+              # --- S3 state + code ---
+              - Sid: S3BucketMeta
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource: !GetAtt StateBucket.Arn
+
+              - Sid: S3Objects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub ${StateBucket.Arn}/portal-monitor/*
+
+Outputs:
+  StateBucketName:
+    Value: !Ref StateBucket
+
+  DeployRoleArn:
+    Description: Put this into GitHub secret AWS_DEPLOY_ROLE_ARN
+    Value: !GetAtt DeployRole.Arn
+
+  DomainsKey:
+    Value: portal-monitor/domains.txt
+
+  UploadDomainsCommand:
+    Value: !Sub |
+      aws s3 cp domains.txt s3://${StateBucket}/portal-monitor/domains.txt --region ${AWS::Region}
+
+  NextSteps:
+    Value: See aws/BOOTSTRAP.md

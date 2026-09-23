@@ -1,0 +1,145 @@
+name: CD - Deploy Lambda
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or SHA to deploy, e.g. v1.0.1"
+        required: true
+        default: main
+
+      enable_webhook:
+        description: >
+          Send Teams alerts. Keep false while evaluating against the
+          K8s CronJob, otherwise both stacks alert on the same change.
+        type: boolean
+        required: true
+        default: false
+
+env:
+  AWS_REGION: ap-east-1
+  STACK_NAME: portal-monitor
+  FUNCTION_NAME: portal-monitor
+
+jobs:
+  deploy:
+    name: Deploy Lambda
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      # Required for OIDC.
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Show release
+        run: |
+          echo "Ref:      ${{ inputs.ref }}"
+          echo "Commit:   $(git rev-parse --short HEAD)"
+          echo "Webhook:  ${{ inputs.enable_webhook }}"
+
+      # --------------------------------------------------
+      # Build the deployment package
+      #
+      # monitor.py has no third-party dependencies and boto3
+      # ships with the runtime, so the zip is just two files.
+      # --------------------------------------------------
+      - name: Build deployment package
+        id: package
+        run: |
+          mkdir -p build
+          cp app/monitor.py build/
+          cp aws/lambda_handler.py build/
+
+          cd build
+          zip -r ../function.zip .
+          cd ..
+
+          echo "key=portal-monitor/code/$(git rev-parse --short HEAD).zip" >> "$GITHUB_OUTPUT"
+
+          unzip -l function.zip
+
+      - name: Upload deployment package
+        run: |
+          aws s3 cp function.zip \
+            "s3://${{ secrets.AWS_STATE_BUCKET }}/${{ steps.package.outputs.key }}"
+
+      # --------------------------------------------------
+      # Deploy
+      #
+      # An empty AlertWebhookUrl makes monitor.py check and
+      # record state without notifying.
+      # --------------------------------------------------
+      - name: Deploy CloudFormation stack
+        run: |
+          if [ "${{ inputs.enable_webhook }}" = "true" ]; then
+            WEBHOOK='${{ secrets.ALERT_WEBHOOK_URL }}'
+          else
+            WEBHOOK=''
+          fi
+
+          aws cloudformation deploy \
+            --stack-name "$STACK_NAME" \
+            --template-file aws/template.yaml \
+            --capabilities CAPABILITY_IAM \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              StateBucketName="${{ secrets.AWS_STATE_BUCKET }}" \
+              CodeS3Key="${{ steps.package.outputs.key }}" \
+              WebRiskApiKey="${{ secrets.WEBRISK_API_KEY }}" \
+              AlertWebhookUrl="$WEBHOOK"
+
+      # --------------------------------------------------
+      # CloudFormation only swaps the code pointer. Wait for
+      # the update to settle before invoking.
+      # --------------------------------------------------
+      - name: Wait for function update
+        run: |
+          aws lambda wait function-updated \
+            --function-name "$FUNCTION_NAME"
+
+      - name: Show stack outputs
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Outputs' \
+            --output table
+
+      # --------------------------------------------------
+      # Smoke test
+      #
+      # FAIL_ON_ERROR is false on the deployed function, so
+      # this only fails on an unhandled error such as a bad
+      # API key or a missing domains.txt.
+      # --------------------------------------------------
+      - name: Invoke once
+        run: |
+          aws lambda invoke \
+            --function-name "$FUNCTION_NAME" \
+            --cli-binary-format raw-in-base64-out \
+            --payload '{}' \
+            --log-type Tail \
+            --query LogResult \
+            --output text \
+            response.json | base64 -d
+
+          echo ""
+          echo "Response:"
+          cat response.json
+          echo ""
+
+          if grep -q '"errorMessage"' response.json; then
+            echo "Lambda returned an error"
+            exit 1
+          fi
