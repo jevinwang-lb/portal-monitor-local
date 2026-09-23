@@ -1,15 +1,12 @@
 import json
 import os
-import random
 import ssl
 import sys
-import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-
-from playwright.sync_api import sync_playwright
 
 
 # ============================================================
@@ -38,84 +35,47 @@ STATE_FILE = os.environ.get(
 
 
 # ------------------------------------------------------------
-# Google Transparency Report
+# Google Web Risk Lookup API
 # ------------------------------------------------------------
 
-REPORT_BASE_URL = (
-    "https://transparencyreport.google.com/"
-    "safe-browsing/search"
+LOOKUP_BASE_URL = (
+    "https://webrisk.googleapis.com/v1/uris:search"
 )
 
-
-# ------------------------------------------------------------
-# Local Chrome
-# ------------------------------------------------------------
-
-CHROME_PATH = os.environ.get(
-    "CHROME_PATH",
-    "/Applications/Google Chrome.app/"
-    "Contents/MacOS/Google Chrome",
+WEBRISK_API_KEY = os.environ.get(
+    "WEBRISK_API_KEY"
 )
 
+# Matches the threat types the Transparency Report POC had
+# already been validated against.
+THREAT_TYPES = [
+    value.strip()
+    for value in os.environ.get(
+        "THREAT_TYPES",
+        "MALWARE,"
+        "SOCIAL_ENGINEERING,"
+        "UNWANTED_SOFTWARE",
+    ).split(",")
+    if value.strip()
+]
+
 
 # ------------------------------------------------------------
-# Browser mode
+# Lookup HTTPS verification
 #
-# Local:
-#   false
-#
-# Docker / Kubernetes:
+# Normal / Kubernetes:
 #   true
+#
+# Local behind Zero Trust TLS inspection:
+#   export LOOKUP_VERIFY_TLS=false
 # ------------------------------------------------------------
 
-PLAYWRIGHT_HEADLESS = (
+LOOKUP_VERIFY_TLS = (
     os.environ.get(
-        "PLAYWRIGHT_HEADLESS",
-        "false",
+        "LOOKUP_VERIFY_TLS",
+        "true",
     ).lower()
     == "true"
-)
-
-
-# ------------------------------------------------------------
-# Browser HTTPS verification
-#
-# Local defaults to false? No.
-# We keep normal verification locally.
-#
-# Docker POC currently defaults to true because your local
-# Docker traffic is affected by Zero Trust TLS inspection.
-#
-# Production should ideally install the corporate CA instead.
-# ------------------------------------------------------------
-
-default_ignore_https = (
-    "true"
-    if PLAYWRIGHT_HEADLESS
-    else "false"
-)
-
-IGNORE_HTTPS_ERRORS = (
-    os.environ.get(
-        "IGNORE_HTTPS_ERRORS",
-        default_ignore_https,
-    ).lower()
-    == "true"
-)
-
-
-# ------------------------------------------------------------
-# Browser identity
-#
-# Playwright's bundled Chromium advertises "HeadlessChrome"
-# in its User-Agent, which Google's anti-bot layer keys on.
-# ------------------------------------------------------------
-
-USER_AGENT = os.environ.get(
-    "USER_AGENT",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/140.0.0.0 Safari/537.36",
 )
 
 
@@ -160,17 +120,10 @@ FAIL_ON_ERROR = (
 # Timeouts
 # ------------------------------------------------------------
 
-NAVIGATION_TIMEOUT_MS = int(
+HTTP_TIMEOUT_SECONDS = int(
     os.environ.get(
-        "NAVIGATION_TIMEOUT_MS",
-        "30000",
-    )
-)
-
-RESULT_TIMEOUT_MS = int(
-    os.environ.get(
-        "RESULT_TIMEOUT_MS",
-        "20000",
+        "HTTP_TIMEOUT_SECONDS",
+        "15",
     )
 )
 
@@ -188,37 +141,6 @@ RETRY_DELAY_SECONDS = int(
     )
 )
 
-# Base delay for the exponential backoff used after Google
-# serves its anti-bot page. Retrying a block after 2 seconds
-# only deepens it.
-BLOCKED_BACKOFF_SECONDS = int(
-    os.environ.get(
-        "BLOCKED_BACKOFF_SECONDS",
-        "15",
-    )
-)
-
-# Jittered pause between domains inside one browser worker,
-# so a run does not look like a burst from a single IP.
-DOMAIN_DELAY_SECONDS = float(
-    os.environ.get(
-        "DOMAIN_DELAY_SECONDS",
-        "3",
-    )
-)
-
-# Keep this at 1. Parallel browsers all share the cluster
-# egress IP, which is what trips Google's anti-bot page.
-CONCURRENCY = max(
-    1,
-    int(
-        os.environ.get(
-            "CONCURRENCY",
-            "1",
-        )
-    ),
-)
-
 
 # ============================================================
 # Helpers
@@ -231,25 +153,33 @@ def now_iso():
     ).isoformat()
 
 
-def safe_filename(value):
+class FatalLookupError(Exception):
+    """API key rejected or Web Risk API not enabled.
 
-    result = value
+    Retrying will not help and every remaining domain would
+    fail the same way, so abort the whole run instead.
+    """
 
-    for char in [
-        "/",
-        ":",
-        "?",
-        "&",
-        "=",
-        "\\",
-    ]:
 
-        result = result.replace(
-            char,
-            "_",
+def open_url(request, verify_tls):
+
+    if verify_tls:
+
+        return urllib.request.urlopen(
+            request,
+            timeout=HTTP_TIMEOUT_SECONDS,
         )
 
-    return result
+    print(
+        "WARNING: TLS verification "
+        "is disabled"
+    )
+
+    return urllib.request.urlopen(
+        request,
+        timeout=HTTP_TIMEOUT_SECONDS,
+        context=ssl._create_unverified_context(),
+    )
 
 
 # ============================================================
@@ -378,316 +308,131 @@ def save_state(state):
 
 
 # ============================================================
-# Google URL
+# Web Risk URL
 # ============================================================
 
-def build_report_url(domain):
+# Web Risk requires a valid URI. domains.txt historically holds
+# bare hosts and host/path entries, so supply a scheme when the
+# entry does not carry one.
+def build_target_uri(domain):
 
-    query = urllib.parse.urlencode(
-        {
-            "url": domain,
-            "hl": "en",
-        }
-    )
+    if "://" in domain:
+
+        return domain
+
+    return "https://" + domain
+
+
+def build_lookup_url(domain):
+
+    params = [
+        ("uri", build_target_uri(domain)),
+        ("key", WEBRISK_API_KEY),
+    ]
+
+    for threat_type in THREAT_TYPES:
+
+        params.append(
+            ("threatTypes", threat_type)
+        )
 
     return (
-        REPORT_BASE_URL
+        LOOKUP_BASE_URL
         + "?"
-        + query
+        + urllib.parse.urlencode(params)
     )
-
-
-# ============================================================
-# Parse Google result
-# ============================================================
-
-# Transparency Report uses more than one unsafe phrasing.
-# Whole-site:
-#   "This site is unsafe"
-# Partial / mixed site (testsafebrowsing etc.):
-#   "Some pages on this site are unsafe"
-#   "contains harmful content"
-
-UNSAFE_PATTERNS = [
-    "this site is unsafe",
-    "site is unsafe",
-    "some pages on this site are unsafe",
-    "pages on this site are unsafe",
-    "contains harmful content",
-]
-
-SAFE_PATTERNS = [
-    "no unsafe content found",
-    "no issues found",
-    "this site is safe",
-]
-
-NO_DATA_PATTERNS = [
-    "no available data",
-]
-
-UNKNOWN_PATTERNS = [
-    "it's hard to provide a simple safety status",
-    "it’s hard to provide a simple safety status",
-]
-
-# Google's anti-bot interstitial. It carries none of the
-# patterns above, so without this it would be misread as
-# UNKNOWN and silently ignored.
-BLOCKED_PATTERNS = [
-    "unusual traffic from your computer network",
-    "our systems have detected unusual traffic",
-    "not a robot",
-]
-
-
-def parse_status(body_text):
-
-    body_lower = body_text.lower()
-
-    for pattern in BLOCKED_PATTERNS:
-
-        if pattern in body_lower:
-
-            return "BLOCKED"
-
-    for pattern in UNSAFE_PATTERNS:
-
-        if pattern in body_lower:
-
-            return "UNSAFE"
-
-    for pattern in SAFE_PATTERNS:
-
-        if pattern in body_lower:
-
-            return "SAFE"
-
-    for pattern in NO_DATA_PATTERNS:
-
-        if pattern in body_lower:
-
-            return "NO_DATA"
-
-    for pattern in UNKNOWN_PATTERNS:
-
-        if pattern in body_lower:
-
-            return "UNKNOWN"
-
-    return "UNKNOWN"
-
-
-# ============================================================
-# Debug output
-# ============================================================
-
-def save_debug(
-    page,
-    domain,
-    body_text,
-):
-
-    debug_dir = os.path.dirname(
-        STATE_FILE
-    )
-
-    if not debug_dir:
-
-        debug_dir = BASE_DIR
-
-    os.makedirs(
-        debug_dir,
-        exist_ok=True,
-    )
-
-    filename = safe_filename(
-        domain
-    )
-
-    text_file = os.path.join(
-        debug_dir,
-        f"debug_{filename}.txt",
-    )
-
-    screenshot_file = os.path.join(
-        debug_dir,
-        f"debug_{filename}.png",
-    )
-
-    try:
-
-        with open(
-            text_file,
-            "w",
-            encoding="utf-8",
-        ) as f:
-
-            f.write(
-                body_text
-            )
-
-        print(
-            "Debug text:",
-            text_file,
-        )
-
-    except Exception as e:
-
-        print(
-            "Failed to save debug text:",
-            e,
-        )
-
-    try:
-
-        page.screenshot(
-            path=screenshot_file,
-            full_page=True,
-        )
-
-        print(
-            "Debug screenshot:",
-            screenshot_file,
-        )
-
-    except Exception as e:
-
-        print(
-            "Failed to save screenshot:",
-            e,
-        )
-
-
-# ============================================================
-# Wait for Google result
-# ============================================================
-
-def wait_for_google_result(page):
-
-    patterns = (
-        UNSAFE_PATTERNS
-        + SAFE_PATTERNS
-        + NO_DATA_PATTERNS
-        + UNKNOWN_PATTERNS
-        + BLOCKED_PATTERNS
-    )
-
-    js_patterns = json.dumps(
-        patterns
-    )
-
-    try:
-
-        page.wait_for_function(
-            f"""
-            () => {{
-                const body = document.body;
-
-                if (!body) {{
-                    return false;
-                }}
-
-                const text =
-                    body.innerText.toLowerCase();
-
-                const patterns = {js_patterns};
-
-                return patterns.some(
-                    (pattern) => text.includes(pattern)
-                );
-            }}
-            """,
-            timeout=RESULT_TIMEOUT_MS,
-        )
-
-        return True
-
-    except Exception:
-
-        return False
 
 
 # ============================================================
 # Single domain check
 # ============================================================
 
-def check_domain_once(
-    page,
-    domain,
-):
+# An empty JSON object means the URI is on none of the
+# requested threat lists.
+def parse_status(payload):
 
-    report_url = build_report_url(
-        domain
+    threat_types = (
+        payload
+        .get("threat", {})
+        .get("threatTypes", [])
     )
 
-    print(
-        "Google Report URL:",
-        report_url,
-    )
-
-    page.goto(
-        report_url,
-        wait_until="domcontentloaded",
-        timeout=NAVIGATION_TIMEOUT_MS,
-    )
-
-    # Google redirects to /sorry/index when it decides the
-    # request is automated. Catch it here so we do not sit
-    # through RESULT_TIMEOUT_MS waiting for a result that
-    # will never render.
-    if "/sorry/" in page.url:
+    if threat_types:
 
         print(
-            "Google anti-bot redirect:",
-            page.url,
+            "Threat types:",
+            ", ".join(threat_types),
         )
 
-        return "BLOCKED"
+        return "UNSAFE"
 
-    result_loaded = (
-        wait_for_google_result(
-            page
-        )
+    return "SAFE"
+
+
+def check_domain_once(domain):
+
+    request = urllib.request.Request(
+        build_lookup_url(domain),
+        method="GET",
     )
 
-    if not result_loaded:
+    try:
+
+        with open_url(
+            request,
+            LOOKUP_VERIFY_TLS,
+        ) as response:
+
+            body = response.read().decode(
+                "utf-8"
+            )
+
+    except urllib.error.HTTPError as e:
+
+        # Google puts the actual reason (SERVICE_DISABLED,
+        # API_KEY_SERVICE_BLOCKED, ...) in the body, not the
+        # status line. Never diagnose one of these blind.
+        try:
+
+            detail = e.read().decode(
+                "utf-8",
+                "replace",
+            ).strip()
+
+        except Exception:
+
+            detail = ""
+
+        if e.code in [
+            400,
+            401,
+            403,
+        ]:
+
+            raise FatalLookupError(
+                f"Web Risk rejected the request "
+                f"(HTTP {e.code}). Check WEBRISK_API_KEY "
+                f"and that the Web Risk API is enabled.\n"
+                f"{detail}"
+            )
 
         print(
-            "WARNING: timed out waiting "
-            "for Google result"
+            "Web Risk error body:",
+            detail,
         )
 
-    body_text = page.locator(
-        "body"
-    ).inner_text()
+        raise
 
-    status = parse_status(
-        body_text
+    return parse_status(
+        json.loads(body)
     )
-
-    # Save debug only for truly unknown results
-    if status == "UNKNOWN":
-
-        save_debug(
-            page,
-            domain,
-            body_text,
-        )
-
-    return status
 
 
 # ============================================================
 # Retry
 # ============================================================
 
-def check_domain(
-    page,
-    domain,
-):
-
-    last_status = None
+def check_domain(domain):
 
     for attempt in range(
         1,
@@ -701,65 +446,13 @@ def check_domain(
 
         try:
 
-            status = check_domain_once(
-                page,
-                domain,
+            return check_domain_once(
+                domain
             )
 
-            last_status = status
+        except FatalLookupError:
 
-            # Definitive / legitimate results
-            if status in [
-                "SAFE",
-                "UNSAFE",
-                "NO_DATA",
-            ]:
-
-                return status
-
-            # Back off exponentially rather than retrying
-            # after RETRY_DELAY_SECONDS, which only deepens
-            # the block.
-            if status == "BLOCKED":
-
-                if attempt < MAX_RETRIES:
-
-                    backoff = (
-                        BLOCKED_BACKOFF_SECONDS
-                        * (2 ** (attempt - 1))
-                    )
-
-                    print(
-                        "BLOCKED by Google, "
-                        f"backing off {backoff}s..."
-                    )
-
-                    time.sleep(
-                        backoff
-                    )
-
-                    continue
-
-                return "BLOCKED"
-
-            # UNKNOWN may be legitimate, but retry in case
-            # Google simply had not finished rendering.
-            if status == "UNKNOWN":
-
-                if attempt < MAX_RETRIES:
-
-                    print(
-                        "UNKNOWN result, "
-                        "retrying..."
-                    )
-
-                    time.sleep(
-                        RETRY_DELAY_SECONDS
-                    )
-
-                    continue
-
-                return "UNKNOWN"
+            raise
 
         except Exception as e:
 
@@ -779,10 +472,6 @@ def check_domain(
                 )
 
                 continue
-
-    if last_status:
-
-        return last_status
 
     return "CHECK_ERROR"
 
@@ -819,44 +508,9 @@ def send_webhook(event):
         method="POST",
     )
 
-    # --------------------------------------------------------
-    # Normal / Kubernetes
-    # --------------------------------------------------------
-
-    if WEBHOOK_VERIFY_TLS:
-
-        with urllib.request.urlopen(
-            request,
-            timeout=15,
-        ) as response:
-
-            print(
-                "Webhook HTTP:",
-                response.status,
-            )
-
-        return
-
-
-    # --------------------------------------------------------
-    # Local POC behind Zero Trust TLS inspection
-    #
-    # Do NOT use this as the production default.
-    # --------------------------------------------------------
-
-    print(
-        "WARNING: Webhook TLS verification "
-        "is disabled"
-    )
-
-    ssl_context = (
-        ssl._create_unverified_context()
-    )
-
-    with urllib.request.urlopen(
+    with open_url(
         request,
-        timeout=15,
-        context=ssl_context,
+        WEBHOOK_VERIFY_TLS,
     ) as response:
 
         print(
@@ -866,287 +520,34 @@ def send_webhook(event):
 
 
 # ============================================================
-# Browser
+# Checks
 # ============================================================
-
-def launch_browser(playwright):
-
-    # --------------------------------------------------------
-    # Docker / Kubernetes
-    # --------------------------------------------------------
-
-    if PLAYWRIGHT_HEADLESS:
-
-        print(
-            "Browser: Playwright Chromium"
-        )
-
-        return (
-            playwright.chromium.launch(
-                headless=True,
-            )
-        )
-
-
-    # --------------------------------------------------------
-    # Local Mac
-    # --------------------------------------------------------
-
-    if not os.path.exists(
-        CHROME_PATH
-    ):
-
-        print(
-            "ERROR: Google Chrome not found:"
-        )
-
-        print(
-            CHROME_PATH
-        )
-
-        sys.exit(2)
-
-    print(
-        "Browser: local Google Chrome"
-    )
-
-    return (
-        playwright.chromium.launch(
-            headless=False,
-            executable_path=CHROME_PATH,
-        )
-    )
-
-
-# ============================================================
-# Parallel checks
-# ============================================================
-
-def split_chunks(items, n):
-
-    n = max(
-        1,
-        min(
-            n,
-            len(items),
-        )
-    )
-
-    chunks = [
-        []
-        for _ in range(n)
-    ]
-
-    for i, item in enumerate(
-        items
-    ):
-
-        chunks[
-            i % n
-        ].append(
-            item
-        )
-
-    return [
-        chunk
-        for chunk in chunks
-        if chunk
-    ]
-
-
-def check_domain_status(
-    page,
-    domain,
-):
-
-    print()
-
-    print(
-        "-" * 60
-    )
-
-    print(
-        "Checking:",
-        domain,
-    )
-
-    try:
-
-        return check_domain(
-            page,
-            domain,
-        )
-
-    except Exception as e:
-
-        print(
-            "Unexpected CHECK ERROR:"
-        )
-
-        print(
-            e
-        )
-
-        return "CHECK_ERROR"
-
-
-def attach_resource_filter(page):
-
-    def handle_route(route):
-
-        if route.request.resource_type in [
-            "image",
-            "font",
-            "media",
-        ]:
-
-            route.abort()
-
-            return
-
-        route.continue_()
-
-    page.route(
-        "**/*",
-        handle_route,
-    )
-
-
-def run_browser_chunk(
-    chunk,
-    results,
-    lock,
-):
-
-    try:
-
-        with sync_playwright() as p:
-
-            browser = launch_browser(
-                p
-            )
-
-            context = browser.new_context(
-                ignore_https_errors=(
-                    IGNORE_HTTPS_ERRORS
-                ),
-                user_agent=USER_AGENT,
-            )
-
-            page = context.new_page()
-
-            attach_resource_filter(
-                page
-            )
-
-            try:
-
-                for index, domain in enumerate(
-                    chunk
-                ):
-
-                    if (
-                        index > 0
-                        and DOMAIN_DELAY_SECONDS > 0
-                    ):
-
-                        delay = random.uniform(
-                            DOMAIN_DELAY_SECONDS * 0.5,
-                            DOMAIN_DELAY_SECONDS * 1.5,
-                        )
-
-                        print(
-                            f"Waiting {delay:.1f}s "
-                            "before next domain"
-                        )
-
-                        time.sleep(
-                            delay
-                        )
-
-                    status = (
-                        check_domain_status(
-                            page,
-                            domain,
-                        )
-                    )
-
-                    with lock:
-
-                        results[
-                            domain
-                        ] = status
-
-            finally:
-
-                context.close()
-
-                browser.close()
-
-    except Exception as e:
-
-        print(
-            "Worker failed:"
-        )
-
-        print(
-            e
-        )
-
-        with lock:
-
-            for domain in chunk:
-
-                if domain not in results:
-
-                    results[
-                        domain
-                    ] = "CHECK_ERROR"
-
 
 def collect_statuses(domains):
 
     results = {}
 
-    lock = threading.Lock()
+    for domain in domains:
 
-    chunks = split_chunks(
-        domains,
-        CONCURRENCY,
-    )
+        print()
 
-    if len(chunks) == 1:
-
-        run_browser_chunk(
-            chunks[0],
-            results,
-            lock,
+        print(
+            "-" * 60
         )
 
-        return results
-
-    threads = []
-
-    for chunk in chunks:
-
-        thread = threading.Thread(
-            target=run_browser_chunk,
-            args=(
-                chunk,
-                results,
-                lock,
-            ),
+        print(
+            "Checking:",
+            domain,
         )
 
-        thread.start()
-
-        threads.append(
-            thread
+        print(
+            "Lookup URI:",
+            build_target_uri(domain),
         )
 
-    for thread in threads:
-
-        thread.join()
+        results[domain] = check_domain(
+            domain
+        )
 
     return results
 
@@ -1181,13 +582,18 @@ def main():
     )
 
     print(
-        "Headless:",
-        PLAYWRIGHT_HEADLESS,
+        "Threat types:",
+        ", ".join(THREAT_TYPES),
     )
 
     print(
-        "Ignore HTTPS errors:",
-        IGNORE_HTTPS_ERRORS,
+        "API key configured:",
+        bool(WEBRISK_API_KEY),
+    )
+
+    print(
+        "Lookup TLS verification:",
+        LOOKUP_VERIFY_TLS,
     )
 
     print(
@@ -1206,23 +612,31 @@ def main():
     )
 
     print(
-        "Concurrency:",
-        CONCURRENCY,
-    )
-
-    print(
-        "Domain delay:",
-        DOMAIN_DELAY_SECONDS,
-    )
-
-    print(
-        "User agent:",
-        USER_AGENT,
-    )
-
-    print(
         "=" * 60
     )
+
+
+    # --------------------------------------------------------
+    # API key
+    # --------------------------------------------------------
+
+    if not WEBRISK_API_KEY:
+
+        print(
+            "ERROR: WEBRISK_API_KEY "
+            "not configured"
+        )
+
+        sys.exit(2)
+
+    if not THREAT_TYPES:
+
+        print(
+            "ERROR: THREAT_TYPES "
+            "is empty"
+        )
+
+        sys.exit(2)
 
 
     # --------------------------------------------------------
@@ -1261,12 +675,25 @@ def main():
 
 
     # --------------------------------------------------------
-    # Playwright
+    # Web Risk
     # --------------------------------------------------------
 
-    statuses = collect_statuses(
-        domains
-    )
+    try:
+
+        statuses = collect_statuses(
+            domains
+        )
+
+    except FatalLookupError as e:
+
+        print()
+
+        print(
+            "FATAL:",
+            e,
+        )
+
+        sys.exit(2)
 
     for domain in domains:
 
@@ -1326,48 +753,6 @@ def main():
                 domain,
             )
 
-        elif status == "NO_DATA":
-
-            print()
-
-            print(
-                "⚪ NO_DATA:",
-                domain,
-            )
-
-            print(
-                "Google currently has "
-                "no available status data."
-            )
-
-        elif status == "UNKNOWN":
-
-            print()
-
-            print(
-                "🟡 UNKNOWN:",
-                domain,
-            )
-
-            print(
-                "Google did not provide "
-                "a clear SAFE/UNSAFE result."
-            )
-
-        elif status == "BLOCKED":
-
-            print()
-
-            print(
-                "🚫 BLOCKED:",
-                domain,
-            )
-
-            print(
-                "Google served its anti-bot page. "
-                "This check produced no result."
-            )
-
         else:
 
             print()
@@ -1376,51 +761,6 @@ def main():
                 "🔴 CHECK_ERROR:",
                 domain,
             )
-
-
-        # ============================================
-        # BLOCKED
-        #
-        # The monitor is blind for this domain, so alert on
-        # it instead of quietly carrying the previous state
-        # forward like UNKNOWN does.
-        # ============================================
-
-        if status == "BLOCKED":
-
-            # Same field shape as status_changed, so the
-            # Power Automate flow can parse one schema.
-            event = {
-                "event":
-                    "monitor_blocked",
-                "domain":
-                    domain,
-                "previous":
-                    previous,
-                "current":
-                    "BLOCKED",
-                "time":
-                    now_iso(),
-            }
-
-            # Webhook alert, plus FAIL_ON_ERROR handling
-            # so the Test Job fails on a block.
-            notification_events.append(
-                event
-            )
-
-            monitor_errors.append(
-                event
-            )
-
-            # Preserve previous valid state
-            if previous is not None:
-
-                new_state[
-                    domain
-                ] = previous
-
-            continue
 
 
         # ============================================
@@ -1441,27 +781,6 @@ def main():
             )
 
             # Preserve previous valid state
-            if previous is not None:
-
-                new_state[
-                    domain
-                ] = previous
-
-            continue
-
-
-        # ============================================
-        # UNKNOWN / NO_DATA
-        #
-        # Neither is considered a safety-state change.
-        # Do not overwrite an existing valid state.
-        # ============================================
-
-        if status in [
-            "UNKNOWN",
-            "NO_DATA",
-        ]:
-
             if previous is not None:
 
                 new_state[

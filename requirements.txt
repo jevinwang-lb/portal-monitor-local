@@ -1,1 +1,2 @@
-playwright==1.62.0
+# The Web Risk Lookup API is a plain REST call, so the monitor
+# runs on the standard library only.
