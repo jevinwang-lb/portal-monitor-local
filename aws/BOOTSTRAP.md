@@ -100,6 +100,7 @@ aws cloudformation deploy \
 
 - `CreateOidcProvider=false`：账号里已有 `token.actions.githubusercontent.com` provider（2026-07-02 创建，Terraform 管理，`ClientIDList` 已含 `sts.amazonaws.com`），直接复用，模板不会去改它。设 `true` 会报 `EntityAlreadyExists`——更要紧的是那个 provider 是**全账号共享**的，其他仓库的 Actions 都依赖它，不要去纳管。
 - `GitHubRefFilter` 不传，用模板默认值 `ref:refs/heads/main`：只有从 `main` dispatch 的 run 能假扮 Deploy Role。要部署哪个分支的代码由 workflow 的 `ref` 输入决定，与这里无关，见第 4 节。
+- 信任策略同时匹配 GitHub OIDC 的**旧** `sub`（`repo:org/repo:…`）和**新**格式（`repo:org@ID/repo@ID:…`，2026-07-15 后新建的仓库）。若你改过模板里的这段，对已存在的 bootstrap Stack 再跑一次 §1 的 `cloudformation deploy` 即可更新 Role，不必重建 Bucket。
 - `CAPABILITY_NAMED_IAM`：因为 Role 用了显式 `RoleName`。
 
 看输出：
@@ -238,7 +239,7 @@ aws cloudformation deploy \
 
 | 现象 | 原因 |
 | --- | --- |
-| CD 假扮 Role 失败 `Not authorized to perform sts:AssumeRoleWithWebIdentity` | Org/Repo 参数写错，或 `GitHubRefFilter` 不覆盖你部署的那个 ref |
+| CD 假扮 Role 失败 `Not authorized to perform sts:AssumeRoleWithWebIdentity` | `AWS_DEPLOY_ROLE_ARN` 错；**Use workflow from** 不是 `main`（与 `GitHubRefFilter` 不符）；或 CloudTrail 里 `sub` 是 `repo:org@123/repo@456:…` 而 Role 仍是旧格式——更新 `aws/bootstrap.yaml` 后重跑 §1 deploy |
 | `EntityAlreadyExists` OIDC | 设成了 `CreateOidcProvider=true`；该账号已有 provider，应保持 `false` |
 | Invoke 报 `domains file not found` | 没上传 `domains.txt` |
 | Invoke 报 `HTTP 403` / `SERVICE_DISABLED` | GCP 开的是 Safe Browsing，不是 Web Risk；或没绑计费 |
