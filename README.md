@@ -35,19 +35,20 @@
       - [Debug Production PVC](#debug-production-pvc)
       - [Debug Test PVC](#debug-test-pvc)
     - [3.13 Useful Commands](#313-useful-commands)
+    - [3.14 Current Deployment Model](#314-current-deployment-model)
   - [4. CI/CD](#4-cicd)
     - [4.1 CI](#41-ci)
     - [4.2 Test CD](#42-test-cd)
     - [4.3 Production CD](#43-production-cd)
-  - [5. AWS Lambda（评估中）](#5-aws-lambda评估中)
-    - [5.1 与 K8s 的差异](#51-与-k8s-的差异)
+  - [5. AWS Lambda（独立部署）](#5-aws-lambda独立部署)
+    - [5.0 部署流程（顺序）](#50-部署流程顺序)
+    - [5.1 与 Kubernetes 的差异](#51-与-kubernetes-的差异)
     - [5.2 一次性准备（底座）](#52-一次性准备底座)
     - [5.3 部署](#53-部署)
-    - [5.4 评估期不要双份告警](#54-评估期不要双份告警)
+    - [5.4 告警（Teams Webhook）](#54-告警teams-webhook)
     - [5.5 运维](#55-运维)
-    - [5.6 淘汰另一条路线时](#56-淘汰另一条路线时)
+    - [5.6 注意事项](#56-注意事项)
   - [Migration from Transparency Report](#migration-from-transparency-report)
-  - [Current Deployment Model](#current-deployment-model)
 
 ---
 
@@ -246,7 +247,7 @@ portal-monitor/
 └── README.md
 ```
 
-`app/monitor.py` 是两种部署方式共用的唯一业务代码。`k8s/` 和 `aws/` 分别是两条承载路线，评估后保留一条。Lambda 那条先看 `aws/BOOTSTRAP.md`。
+`app/monitor.py` 是共用业务代码。承载可以选 **Kubernetes CronJob**（`k8s/`）或 **AWS Lambda**（`aws/`），二者互不依赖；选 Lambda 时按 `aws/BOOTSTRAP.md` 操作即可。
 
 Runtime 文件不要提交 Git：
 
@@ -1257,6 +1258,48 @@ kubectl get jobs \
 
 ---
 
+### 3.14 Current Deployment Model
+
+Kubernetes 路线的端到端流程（与第 4 节 CI/CD、第 3.8–3.9 节 manifest 对应）：
+
+```text
+Developer
+   │
+   └── git push main
+          ↓
+         CI
+          ↓
+Docker Hub :sha-xxxxxxx
+          ↓
+     Automatic Test CD
+          ↓
+       Test Job
+          ↓
+ Test PVC / status.json
+          ↓
+       Validation
+          ↓
+      Git Tag v1.x.x
+          ↓
+ Docker Hub :v1.x.x
+          ↓
+  Manual Test Job (same tag)
+          ↓
+    Production CD
+          ↓
+ Production CronJob
+          ↓
+  Every 6 Hours
+          ↓
+ Google Web Risk Lookup API
+          ↓
+      Status Change
+          ↓
+      Teams Alert
+```
+
+---
+
 ## 4. CI/CD
 
 ### 4.1 CI
@@ -1353,11 +1396,55 @@ lifebytehub/portal-monitor:v1.0.0
 
 ---
 
-## 5. AWS Lambda（评估中）
+## 5. AWS Lambda（独立部署）
 
-Lambda 是与 Kubernetes CronJob **并行**的第二种部署方式，用于评估后择一保留。两者跑同一份 `app/monitor.py`，代码零差异。
+在 **LB-INFRA-PROD-972910065688** / **ap-east-1** 上运行的无服务器部署方式：EventBridge 定时触发 Lambda，状态与域名清单放在 S3，CD 走 GitHub Actions OIDC。与 Kubernetes 路线**无运行时耦合**——不必建集群、不必推 Docker 镜像。细节见 **[aws/BOOTSTRAP.md](aws/BOOTSTRAP.md)**。
 
-### 5.1 与 K8s 的差异
+### 5.0 部署流程（顺序）
+
+Lambda 路线从空底座到定时监控的顺序（与 §5.2–§5.3、`cd-lambda.yml` 对应）：
+
+```text
+Infra-admin（账号 972910065688，一次）
+   │
+   └── cloudformation deploy  aws/bootstrap.yaml
+          ↓
+   S3 Bucket + IAM Role portal-monitor-github-deploy
+          ↓
+   aws s3 cp domains.txt → s3://…/portal-monitor/domains.txt
+          ↓
+   GitHub Secrets
+   （AWS_DEPLOY_ROLE_ARN / AWS_STATE_BUCKET / WEBRISK_API_KEY / ALERT_WEBHOOK_URL 按需）
+          ↓
+Developer
+   │
+   └── Actions → CD - Deploy Lambda
+       （Use workflow from: main · ref · enable_webhook）
+          ↓
+   GitHub OIDC 假扮 Deploy Role
+          ↓
+   打包 monitor.py + lambda_handler.py → zip → S3
+          ↓
+   cloudformation deploy  aws/template.yaml
+          ↓
+   Lambda + EventBridge Scheduler（默认定时 DISABLED）
+          ↓
+   Smoke invoke（需有效 WEBRISK_API_KEY 才完整成功）
+          ↓
+   （上线）ScheduleState=ENABLED
+          ↓
+   每天 4 次（Asia/Shanghai）触发 Lambda
+          ↓
+   S3 读 domains.txt + status.json
+          ↓
+   monitor.main() → 回写 status.json
+          ↓
+   Google Web Risk Lookup API
+          ↓
+   状态变化 → Teams（enable_webhook=true 且已配 Webhook 时）
+```
+
+### 5.1 与 Kubernetes 的差异
 
 承载方式不同的地方只有三处：
 
@@ -1383,7 +1470,7 @@ Lambda 路线不需要 Docker Hub。`monitor.py` 无第三方依赖，`boto3` �
 
 ### 5.2 一次性准备（底座）
 
-目标账号是 `LB-INFRA-PROD-972910065688`，Region `ap-east-1`——与现有 CronJob 所在的 EKS 集群同 Region。不要手搓 IAM / Bucket，用 bootstrap Stack 一次建好底座，再跑日常 CD：
+目标账号是 `LB-INFRA-PROD-972910065688`，Region `ap-east-1`。不要手搓 IAM / Bucket，用 bootstrap Stack 一次建好底座，再跑日常 CD：
 
 完整步骤见 **[aws/BOOTSTRAP.md](aws/BOOTSTRAP.md)**。摘要：
 
@@ -1394,8 +1481,8 @@ Lambda 路线不需要 Docker Hub。`monitor.py` 无第三方依赖，`boto3` �
       （GitHub OIDC Provider 复用账号现有的，不重建）
 
 2. 上传 domains.txt 到 Bucket
-3. 填 GitHub Secrets（Role ARN / Bucket / Web Risk Key / Webhook）
-4. Actions → CD - Deploy Lambda（enable_webhook=false）
+3. 填 GitHub Secrets（Role ARN / Bucket / Web Risk Key；Webhook 按需）
+4. Actions → CD - Deploy Lambda
 ```
 
 ```bash
@@ -1425,11 +1512,12 @@ aws cloudformation deploy \
 Actions → **CD - Deploy Lambda** → Run workflow：
 
 ```text
-ref              分支 / tag / SHA
-enable_webhook   是否发 Teams 告警
+Use workflow from   main          # OIDC 须匹配 bootstrap 的 GitHubRefFilter
+ref                 main          # 打进 zip 的代码版本
+enable_webhook      true / false  # 见 5.4
 ```
 
-Workflow 依次做：打包 zip → 上传 S3 → `aws cloudformation deploy` → 等待函数更新 → 执行一次冒烟调用并打印日志。
+Workflow 依次做：打包 zip → 上传 S3 → `aws cloudformation deploy` → 等待函数更新 → 执行一次冒烟调用并打印日志。CD 最后一步在缺少有效 `WEBRISK_API_KEY` 时会失败，属预期；infra 与 key 都就绪后应变绿。
 
 Stack 由 `aws/template.yaml` 定义，包含 Lambda、执行角色、日志组、EventBridge Scheduler 及其调用角色。调度默认：
 
@@ -1438,31 +1526,19 @@ ScheduleExpression: cron(0 0,6,12,18 * * ? *)
 ScheduleExpressionTimezone: Asia/Shanghai
 ```
 
-与 CronJob 一致，即北京时间 00:00 / 06:00 / 12:00 / 18:00。
+即北京时间 00:00 / 06:00 / 12:00 / 18:00。新建 Stack 时 **Schedule 默认 DISABLED**，Web Risk 与冒烟 invoke 都通过后再在 `BOOTSTRAP.md` 里按说明设为 ENABLED。
 
 ---
 
-### 5.4 评估期不要双份告警
+### 5.4 告警（Teams Webhook）
 
-两套并行时各有独立状态，同一个域名状态变化会触发两份 Teams 通知。
+- **`enable_webhook=false`**（默认）：Lambda 照常查域名、写 `status.json`，不调用 Teams。可不配置 `ALERT_WEBHOOK_URL`。
+- **`enable_webhook=true`**：须在 GitHub 配置 Secret **`ALERT_WEBHOOK_URL`**，CD 会把它写入 Lambda 环境变量。
 
-评估期把 `enable_webhook` 保持 `false`。`monitor.py` 在 `ALERT_WEBHOOK_URL` 未配置时照常检查、照常写状态，只是不发通知：
+`monitor.py` 在未配置 webhook 时只打日志：
 
 ```text
 INFO: ALERT_WEBHOOK_URL not configured
-```
-
-这样可以拿 Lambda 的结果和 K8s 对照，而不打扰频道。比对两边状态：
-
-```bash
-aws s3 cp "s3://$STATE_BUCKET/portal-monitor/status.json" - | jq -S .
-```
-
-确认切换到 Lambda 后，再用 `enable_webhook=true` 重新部署，并 suspend CronJob：
-
-```bash
-kubectl patch cronjob portal-monitor \
-  -p '{"spec":{"suspend":true}}'
 ```
 
 ---
@@ -1501,28 +1577,17 @@ Bucket 不在 Stack 内，不会被一起删掉。
 
 ---
 
-### 5.6 淘汰另一条路线时
+### 5.6 注意事项
 
-评估结束后直接删掉不用的那套文件，不要把 workflow 注释起来留在仓库里——注释掉的 YAML 不会被任何人维护，也不会被 CI 验证。需要临时停用时用 GitHub 的 **Disable workflow**（仓库 Actions 页面），不改任何文件，随时可恢复。
-
-选定 Lambda 时可以删除：
-
-```text
-k8s/
-Dockerfile
-.github/workflows/docker-publish.yml
-.github/workflows/cd-test-job.yml
-.github/workflows/cd-cronjob.yml
-```
-
-选定 Kubernetes 时可以删除：
-
-```text
-aws/
-.github/workflows/cd-lambda.yml
-```
-
-两套 CD 都是 `workflow_dispatch` 手动触发，不点就不会跑，所以评估期不需要额外做什么来防止误触发。
+1. **账号与 Region**：仅 **`972910065688`** / **`ap-east-1`**。bootstrap 不要设 `CreateOidcProvider=true`（会动到全账号共用的 GitHub OIDC Provider）。
+2. **GitHub OIDC `sub`**：2026-07 后新建的仓库带 owner/repo ID，bootstrap 信任策略需含 `repo:org@*/repo@*` 模式（见当前 `aws/bootstrap.yaml`）。CD 必须从 **`main`** dispatch（与 `GitHubRefFilter` 一致）。
+3. **Secrets**：GitHub **不能存空 secret**；`WEBRISK_API_KEY` 要么不建（Lambda 里为空），要么填非空（真 key 或占位）。占位 key 会在 invoke 得到 Google `API_KEY_INVALID`。
+4. **Schedule**：默认定时 **关闭**；key 与 invoke 验证通过后再 `ScheduleState=ENABLED`（见 `aws/BOOTSTRAP.md`）。
+5. **首次运行与 S3**：执行角色需对 `portal-monitor/` 前缀有 **`s3:ListBucket`**，否则缺少 `status.json` 时 HeadObject 会 403（已在 `aws/template.yaml` 修复）。
+6. **域名与配额**：Web Risk 按 URL 计费；默认定时每天 4 次，注意域名数量与 [免费额度](https://cloud.google.com/web-risk/pricing)（约 10 万次/月）。
+7. **与 Kubernetes 路线**：仓库虽同时含 `k8s/` 与 `aws/`，**生产上只应跑一种**定时监控实例，并只开一路 Teams 告警，避免同一域名变更通知两次。若只用 Lambda，无需操作 EKS / CronJob。
+8. **拆除**：删 Stack `portal-monitor` 不会删 bootstrap 桶（`DeletionPolicy: Retain`）；版本控制桶需按 `BOOTSTRAP.md` §7 按版本清空后再删桶。
+9. **CD 触发**：`cd-lambda.yml` 为 **workflow_dispatch**，不手动 Run 不会部署；临时停用可用 GitHub **Disable workflow**，勿把 YAML 注释掉留在仓库。
 
 ---
 
@@ -1552,46 +1617,4 @@ aws/
 ```bash
 kubectl get cronjob portal-monitor \
   -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].image}'; echo
-```
-
----
-
-## Current Deployment Model
-
-最终流程：
-
-```text
-Developer
-   │
-   └── git push main
-          ↓
-         CI
-          ↓
-Docker Hub :sha-xxxxxxx
-          ↓
-     Automatic Test CD
-          ↓
-       Test Job
-          ↓
- Test PVC / status.json
-          ↓
-       Validation
-          ↓
-      Git Tag v1.x.x
-          ↓
- Docker Hub :v1.x.x
-          ↓
-  Manual Test Job (same tag)
-          ↓
-    Production CD
-          ↓
- Production CronJob
-          ↓
-  Every 6 Hours
-          ↓
- Google Web Risk Lookup API
-          ↓
-      Status Change
-          ↓
-      Teams Alert
 ```
