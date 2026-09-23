@@ -84,7 +84,18 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              # Scoped to the monitor prefix, not the whole bucket.
+              # Without ListBucket on the prefix, HeadObject/GetObject on a
+              # missing key (first run, no status.json yet) returns 403
+              # instead of 404, which breaks download()'s missing-key check.
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub arn:aws:s3:::${StateBucketName}
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - portal-monitor/*
+
               - Effect: Allow
                 Action:
                   - s3:GetObject
