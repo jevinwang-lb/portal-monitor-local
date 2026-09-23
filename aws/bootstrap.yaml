@@ -105,8 +105,13 @@ Resources:
             Condition:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              # GitHub repos created after 2026-07-15 emit an immutable
+              # sub with owner/repo IDs, e.g.
+              # repo:org@123/repo@456:ref:refs/heads/main
               StringLike:
-                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${GitHubRepo}:${GitHubRefFilter}
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubOrg}/${GitHubRepo}:${GitHubRefFilter}
+                  - !Sub repo:${GitHubOrg}@*/${GitHubRepo}@*:${GitHubRefFilter}
 
       Policies:
         - PolicyName: portal-monitor-deploy
