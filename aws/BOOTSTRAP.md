@@ -241,6 +241,7 @@ aws cloudformation deploy \
 | --- | --- |
 | CD 假扮 Role 失败 `Not authorized to perform sts:AssumeRoleWithWebIdentity` | `AWS_DEPLOY_ROLE_ARN` 错；**Use workflow from** 不是 `main`（与 `GitHubRefFilter` 不符）；或 CloudTrail 里 `sub` 是 `repo:org@123/repo@456:…` 而 Role 仍是旧格式——更新 `aws/bootstrap.yaml` 后重跑 §1 deploy |
 | `EntityAlreadyExists` OIDC | 设成了 `CreateOidcProvider=true`；该账号已有 provider，应保持 `false` |
+| Invoke 报 `HeadObject` / `403 Forbidden` 在拉 `status.json` | 首次运行没有 state 文件；若 Lambda 角色缺 `s3:ListBucket`（旧 template）也会 403 而非 404——更新 `aws/template.yaml` 后重跑 CD |
 | Invoke 报 `domains file not found` | 没上传 `domains.txt` |
 | Invoke 报 `HTTP 403` / `SERVICE_DISABLED` | GCP 开的是 Safe Browsing，不是 Web Risk；或没绑计费 |
 | Invoke 报 `WEBRISK_API_KEY not configured` | GitHub secret `WEBRISK_API_KEY` 为空 |
