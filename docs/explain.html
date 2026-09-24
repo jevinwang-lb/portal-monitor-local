@@ -286,9 +286,11 @@
       <p class="eyebrow">portal-monitor</p>
       <h1>Portal Safe Browsing Monitor</h1>
       <p class="lede">
-        调用 Google Web Risk Lookup API，检查配置的域名或 URL 是否在威胁列表中。
-        只有有效安全状态变化时，才通过 Teams Webhook 通知。Production 跑在 EKS CronJob 上，
-        按北京时间每 6 小时一次（每天 4 轮）。
+        调用 Google Web Risk Lookup API，检查配置的域名或 URL 是否在威胁列表中；
+        只有有效安全状态变化时，才通过 Teams Webhook 通知。
+        业务逻辑在 <code>app/monitor.py</code>，承载二选一：<strong>Kubernetes CronJob</strong>（EKS + Docker）
+        或 <strong>AWS Lambda</strong>（972910065688 / ap-east-1 + S3），二者互不依赖。
+        默认定时均为北京时间每 6 小时（每天 4 轮）。
       </p>
     </div>
   </header>
@@ -299,7 +301,9 @@
       <a href="#local">1. Local</a>
       <a href="#docker">2. Docker</a>
       <a href="#k8s">3. Kubernetes</a>
+      <a href="#k8s-flow">K8s 流程</a>
       <a href="#cicd">4. CI / CD</a>
+      <a href="#lambda">5. Lambda</a>
       <a href="#debug">排障</a>
     </nav>
 
@@ -368,8 +372,8 @@
 
         <ol>
           <li>校验 <code>WEBRISK_API_KEY</code> 和 <code>THREAT_TYPES</code>，缺失直接以 <code>2</code> 退出。</li>
-          <li>读域名列表（本机 <code>domains.txt</code>；K8s 挂 ConfigMap 到 <code>/app/domains.txt</code>）。跳过空行和 <code>#</code>，去重并保序。</li>
-          <li>读状态文件（本机 <code>status.json</code>；容器 <code>/data/status.json</code>）。不存在则视为空。</li>
+          <li>读域名列表（本机 <code>domains.txt</code>；K8s ConfigMap → <code>/app/domains.txt</code>；Lambda 经 handler 从 S3 拉到 <code>/tmp/domains.txt</code>）。跳过空行和 <code>#</code>，去重并保序。</li>
+          <li>读状态文件（本机 <code>status.json</code>；K8s PVC <code>/data/status.json</code>；Lambda S3 ↔ <code>/tmp/status.json</code>）。不存在则视为空。</li>
           <li>逐个条目补全 URI（裸域名加 <code>https://</code>），GET <code>uris:search</code>。</li>
           <li>异常最多重试 3 次（<code>MAX_RETRIES</code>），间隔 <code>RETRY_DELAY_SECONDS</code>。</li>
           <li>决定是否覆盖状态、是否加入通知队列。</li>
@@ -504,6 +508,11 @@ UNWANTED_SOFTWARE</pre>
             <tr><td><code>docker-publish.yml</code></td><td>CI：构建并推送 Docker Hub 镜像</td></tr>
             <tr><td><code>cd-test-job.yml</code></td><td>CI 后自动跑测试 Job，挂<strong>测试 PVC</strong>；也可手动填 <code>v*</code> tag</td></tr>
             <tr><td><code>cd-cronjob.yml</code></td><td>手动把指定版本发布到生产 CronJob</td></tr>
+            <tr><td><code>aws/bootstrap.yaml</code></td><td>Lambda 一次性：S3 + GitHub OIDC Deploy Role（账号 972910065688）</td></tr>
+            <tr><td><code>aws/template.yaml</code></td><td>Lambda + EventBridge Scheduler + 执行角色</td></tr>
+            <tr><td><code>aws/lambda_handler.py</code></td><td>S3 ↔ /tmp 代理，<code>monitor.py</code> 无感知</td></tr>
+            <tr><td><code>cd-lambda.yml</code></td><td>手动 CD：zip 部署 Lambda（<code>workflow_dispatch</code>）</td></tr>
+            <tr><td><code>aws/BOOTSTRAP.md</code></td><td>Lambda 账号 bootstrap 与运维步骤</td></tr>
           </tbody>
         </table>
         <p class="muted">不要提交：<code>status.json</code>、<code>docker-state/</code>、API Key、Webhook URL、<code>.env</code>。</p>
@@ -605,11 +614,47 @@ python3 app/monitor.py</pre>
           <li>手工立刻跑生产：先 <code>suspend: true</code>，再 <code>kubectl create job --from=cronjob/portal-monitor …</code>。<code>Forbid</code> 不管手工 Job；和生产 Cron 同时跑会抢同一块 RWO。</li>
           <li><code>cd-test-job.yml</code> 挂测试 PVC；生产只走 <code>cd-cronjob.yml</code>。不要直接 apply 带 <code>IMAGE_PLACEHOLDER</code> 的 yaml。</li>
         </ul>
+
+        <h3 id="k8s-flow">Current Deployment Model（Kubernetes）</h3>
+        <p class="muted">与下文「4. CI / CD」及本节 manifest 对应。</p>
+        <pre>Developer
+   │
+   └── git push main
+          ↓
+         CI
+          ↓
+Docker Hub :sha-xxxxxxx
+          ↓
+     Automatic Test CD
+          ↓
+       Test Job
+          ↓
+ Test PVC / status.json
+          ↓
+       Validation
+          ↓
+      Git Tag v1.x.x
+          ↓
+ Docker Hub :v1.x.x
+          ↓
+  Manual Test Job (same tag)
+          ↓
+    Production CD
+          ↓
+ Production CronJob
+          ↓
+  Every 6 Hours
+          ↓
+ Google Web Risk Lookup API
+          ↓
+      Status Change
+          ↓
+      Teams Alert</pre>
       </section>
 
       <section id="cicd">
-        <h2>4. CI / CD</h2>
-        <p class="muted">日常测试跟 <code>main</code> 的 SHA；生产跟 Semver tag。不要把未验证的 <code>sha-…</code> 直接指到 CronJob。</p>
+        <h2>4. CI / CD（Kubernetes 路线）</h2>
+        <p class="muted">日常测试跟 <code>main</code> 的 SHA；生产跟 Semver tag。不要把未验证的 <code>sha-…</code> 直接指到 CronJob。Lambda 部署见下一节。</p>
 
         <div class="pipe">
           <div class="pipe-step">
@@ -659,6 +704,70 @@ python3 app/monitor.py</pre>
         </ul>
       </section>
 
+      <section id="lambda">
+        <h2>5. AWS Lambda（独立部署）</h2>
+        <p>
+          在 <strong>LB-INFRA-PROD-972910065688</strong>、Region <strong>ap-east-1</strong> 上运行：
+          EventBridge 定时触发 Lambda，<code>domains.txt</code> 与 <code>status.json</code> 在 S3，
+          CD 经 GitHub Actions OIDC 假扮 IAM Role。不需要 EKS、Docker Hub 或本节的 CI/CD 流水线。
+        </p>
+
+        <h3>部署流程（顺序）</h3>
+        <pre>Infra-admin（一次）
+   │
+   └── cloudformation deploy  aws/bootstrap.yaml
+          ↓
+   S3 Bucket + IAM Role portal-monitor-github-deploy
+          ↓
+   aws s3 cp domains.txt → s3://…/portal-monitor/domains.txt
+          ↓
+   GitHub Secrets
+   （AWS_DEPLOY_ROLE_ARN / AWS_STATE_BUCKET / WEBRISK_API_KEY / ALERT_WEBHOOK_URL 按需）
+          ↓
+Developer
+   │
+   └── Actions → CD - Deploy Lambda
+       （Use workflow from: main · ref · enable_webhook）
+          ↓
+   GitHub OIDC → zip → S3 → aws/template.yaml
+          ↓
+   Lambda + Scheduler（默认定时 DISABLED）
+          ↓
+   Smoke invoke
+          ↓
+   （上线）ScheduleState=ENABLED
+          ↓
+   每天 4 次（Asia/Shanghai）
+          ↓
+   S3 → monitor.main() → status.json
+          ↓
+   Web Risk API → 状态变化 → Teams（enable_webhook=true 时）</pre>
+
+        <div class="grid-2">
+          <div class="card">
+            <h3>与 K8s 的差异</h3>
+            <ul>
+              <li>清单 / 状态：S3 前缀 <code>portal-monitor/</code></li>
+              <li>部署包：zip（<code>monitor.py</code> + <code>lambda_handler.py</code>）</li>
+              <li>定时：EventBridge Scheduler</li>
+              <li>CD：<code>cd-lambda.yml</code>（<code>ubuntu-latest</code> + OIDC）</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>告警</h3>
+            <p>
+              <code>enable_webhook=false</code>：只查域、写 S3，可不配 <code>ALERT_WEBHOOK_URL</code>。
+              <code>true</code> 时需 GitHub Secret <code>ALERT_WEBHOOK_URL</code>。
+            </p>
+          </div>
+        </div>
+
+        <div class="callout">
+          <p><strong>操作细节</strong>以仓库内 <code>aws/BOOTSTRAP.md</code> 与 README §5 为准（OIDC <code>sub</code> 含 owner/repo ID、GitHub 不能存空 secret、Schedule 上线步骤、S3 拆除等）。</p>
+          <p><strong>生产注意</strong>：同一批域名不要同时开 Lambda Schedule 与 K8s CronJob 且都发 Teams；选一种承载即可。</p>
+        </div>
+      </section>
+
       <section id="debug">
         <h2>怎么确认「没检测出来」是哪一种</h2>
         <p>
@@ -671,6 +780,9 @@ python3 app/monitor.py</pre>
           <li><strong>UNSAFE 且 No status change</strong> — 检测成功，只是不重复告警。</li>
           <li><strong>CHECK_ERROR</strong> — 超时 / <code>429</code> / <code>5xx</code>，重试耗尽。上次的有效状态会保留。</li>
           <li><strong>全部 SAFE 但你确信某页面有问题</strong> — 大概率是 URL 级匹配的问题：清单里写的是裸域名，而被标记的是具体路径。把完整 URL 加进 <code>domains.txt</code>。</li>
+          <li><strong>Lambda：HeadObject 403 拉 status.json</strong> — 首次无 state 时执行角色需 <code>s3:ListBucket</code>（前缀 <code>portal-monitor/*</code>）；见当前 <code>aws/template.yaml</code>。</li>
+          <li><strong>Lambda：OIDC AssumeRole 失败</strong> — <code>AWS_DEPLOY_ROLE_ARN</code>、必须从 <code>main</code> dispatch；GitHub 新仓库 <code>sub</code> 带 <code>@ownerId/repoId</code>，bootstrap 信任策略需匹配。</li>
+          <li><strong>Lambda：<code>API_KEY_INVALID</code></strong> — 占位 key 或 GCP 未启用 Web Risk；GitHub Secret 须非空才有 key。</li>
         </ul>
 
         <p>可以先用 curl 绕开整个程序，直接确认 Google 那边怎么答：</p>
@@ -682,9 +794,12 @@ python3 app/monitor.py</pre>
 &amp;key=$WEBRISK_API_KEY"</pre>
         <p class="muted">返回 <code>{}</code> 就是未命中。这一步能把「程序解析错了」和「Google 本来就没标记」区分开。</p>
 
-        <p>Pod 已 Completed 时不能 exec。起一个临时 busybox 挂同一 PVC（RWO：等 monitor 结束再挂）：</p>
+        <p>Kubernetes：Pod 已 Completed 时不能 exec。临时 busybox 挂同一 PVC（RWO：等 monitor 结束再挂）：</p>
         <pre>ls -l /data
 cat /data/status.json</pre>
+        <p>Lambda：看 CloudWatch 或 S3 状态文件：</p>
+        <pre>aws logs tail /aws/lambda/portal-monitor --follow --region ap-east-1
+aws s3 cp s3://portal-monitor-infra-972910065688/portal-monitor/status.json -</pre>
 
         <div class="callout">
           <p>
