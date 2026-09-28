@@ -35,19 +35,18 @@
       - [Debug Production PVC](#debug-production-pvc)
       - [Debug Test PVC](#debug-test-pvc)
     - [3.13 Useful Commands](#313-useful-commands)
-    - [3.14 Current Deployment Model](#314-current-deployment-model)
-  - [4. CI/CD](#4-cicd)
-    - [4.1 CI](#41-ci)
-    - [4.2 Test CD](#42-test-cd)
-    - [4.3 Production CD](#43-production-cd)
-  - [5. AWS Lambda（独立部署）](#5-aws-lambda独立部署)
-    - [5.0 部署流程（顺序）](#50-部署流程顺序)
-    - [5.1 与 Kubernetes 的差异](#51-与-kubernetes-的差异)
-    - [5.2 一次性准备（底座）](#52-一次性准备底座)
-    - [5.3 部署](#53-部署)
-    - [5.4 告警（Teams Webhook）](#54-告警teams-webhook)
-    - [5.5 运维](#55-运维)
-    - [5.6 注意事项](#56-注意事项)
+    - [3.14 CI](#314-ci)
+    - [3.15 Test CD](#315-test-cd)
+    - [3.16 Production CD](#316-production-cd)
+    - [3.17 Current Deployment Model](#317-current-deployment-model)
+  - [4. AWS Lambda（独立部署）](#4-aws-lambda独立部署)
+    - [4.0 部署流程（顺序）](#40-部署流程顺序)
+    - [4.1 与 Kubernetes 的差异](#41-与-kubernetes-的差异)
+    - [4.2 一次性准备（底座）](#42-一次性准备底座)
+    - [4.3 部署](#43-部署)
+    - [4.4 告警（Teams Webhook）](#44-告警teams-webhook)
+    - [4.5 运维](#45-运维)
+    - [4.6 注意事项](#46-注意事项)
   - [Migration from Transparency Report](#migration-from-transparency-report)
 
 ---
@@ -217,11 +216,12 @@ Lookup API `uris.search` 每月前 100,000 次免费，之后 $0.50 / 1,000 次�
 ```text
 portal-monitor/
 ├── .github/
-│   └── workflows/
+│   ├── workflows/
+│   │   └── cd-lambda.yml
+│   └── workflows-disabled/   # Docker / K8s CD（暂存，移回 workflows/ 即启用）
 │       ├── docker-publish.yml
 │       ├── cd-test-job.yml
-│       ├── cd-cronjob.yml
-│       └── cd-lambda.yml
+│       └── cd-cronjob.yml
 │
 ├── app/
 │   └── monitor.py
@@ -1258,9 +1258,105 @@ kubectl get jobs \
 
 ---
 
-### 3.14 Current Deployment Model
+### 3.14 CI
 
-Kubernetes 路线的端到端流程（与第 4 节 CI/CD、第 3.8–3.9 节 manifest 对应）：
+工作流：`.github/workflows-disabled/docker-publish.yml`（启用时移回 `.github/workflows/`）
+
+GitHub Actions：
+
+```text
+main push
+   ↓
+Build Docker
+   ↓
+Push Docker Hub
+   ↓
+sha-xxxxxxx
+```
+
+例如：
+
+```text
+lifebytehub/portal-monitor:sha-c0691a8
+```
+
+Git Tag：
+
+```bash
+git tag v1.0.1
+git push origin v1.0.1
+```
+
+生成：
+
+```text
+lifebytehub/portal-monitor:v1.0.1
+```
+
+---
+
+### 3.15 Test CD
+
+工作流：`.github/workflows-disabled/cd-test-job.yml`（启用时移回 `.github/workflows/`）
+
+`main` 上 CI 成功后自动跑 Test Job，镜像是 `sha-xxxxxxx`：
+
+```text
+CI success
+    ↓
+CD Test Job
+    ↓
+Deploy sha-xxxxxxx
+    ↓
+portal-monitor-test
+    ↓
+portal-monitor-state-test
+    ↓
+Completed
+```
+
+打 `v*` tag 会再构建一份生产镜像，**不会**自动跑 Test Job。上生产前用同一个 tag 手动跑一次：
+
+Actions → **CD - Test** → Run workflow → `image_tag` 填 `v1.0.1`
+
+---
+
+### 3.16 Production CD
+
+工作流：`.github/workflows-disabled/cd-cronjob.yml`（手动，输入 `v1.x.x`；启用时移回 `.github/workflows/`）
+
+```text
+SHA Test Passed
+    ↓
+git tag v1.x.x  (打在已测过的那个 commit 上)
+    ↓
+Docker Hub :v1.x.x
+    ↓
+CD Test Job (手动，同一 tag)
+    ↓
+CD Production
+    ↓
+Update CronJob
+```
+
+查看 Production 当前 Image：
+
+```bash
+kubectl get cronjob portal-monitor \
+  -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].image}'; echo
+```
+
+例如：
+
+```text
+lifebytehub/portal-monitor:v1.0.0
+```
+
+---
+
+### 3.17 Current Deployment Model
+
+Kubernetes 路线的端到端流程（与 §3.14–3.16 CI/CD、§3.8–3.9 manifest 对应）：
 
 ```text
 Developer
@@ -1300,109 +1396,13 @@ Docker Hub :sha-xxxxxxx
 
 ---
 
-## 4. CI/CD
-
-### 4.1 CI
-
-GitHub Actions：
-
-```text
-main push
-   ↓
-Build Docker
-   ↓
-Push Docker Hub
-   ↓
-sha-xxxxxxx
-```
-
-例如：
-
-```text
-lifebytehub/portal-monitor:sha-c0691a8
-```
-
-Git Tag：
-
-```bash
-git tag v1.0.1
-git push origin v1.0.1
-```
-
-生成：
-
-```text
-lifebytehub/portal-monitor:v1.0.1
-```
-
----
-
-### 4.2 Test CD
-
-工作流：`.github/workflows/cd-test-job.yml`
-
-`main` 上 CI 成功后自动跑 Test Job，镜像是 `sha-xxxxxxx`：
-
-```text
-CI success
-    ↓
-CD Test Job
-    ↓
-Deploy sha-xxxxxxx
-    ↓
-portal-monitor-test
-    ↓
-portal-monitor-state-test
-    ↓
-Completed
-```
-
-打 `v*` tag 会再构建一份生产镜像，**不会**自动跑 Test Job。上生产前用同一个 tag 手动跑一次：
-
-Actions → **CD - Test** → Run workflow → `image_tag` 填 `v1.0.1`
-
----
-
-### 4.3 Production CD
-
-工作流：`.github/workflows/cd-cronjob.yml`（手动，输入 `v1.x.x`）
-
-```text
-SHA Test Passed
-    ↓
-git tag v1.x.x  (打在已测过的那个 commit 上)
-    ↓
-Docker Hub :v1.x.x
-    ↓
-CD Test Job (手动，同一 tag)
-    ↓
-CD Production
-    ↓
-Update CronJob
-```
-
-查看 Production 当前 Image：
-
-```bash
-kubectl get cronjob portal-monitor \
-  -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].image}'; echo
-```
-
-例如：
-
-```text
-lifebytehub/portal-monitor:v1.0.0
-```
-
----
-
-## 5. AWS Lambda（独立部署）
+## 4. AWS Lambda（独立部署）
 
 在 **LB-INFRA-PROD-972910065688** / **ap-east-1** 上运行的无服务器部署方式：EventBridge 定时触发 Lambda，状态与域名清单放在 S3，CD 走 GitHub Actions OIDC。与 Kubernetes 路线**无运行时耦合**——不必建集群、不必推 Docker 镜像。细节见 **[aws/BOOTSTRAP.md](aws/BOOTSTRAP.md)**。
 
-### 5.0 部署流程（顺序）
+### 4.0 部署流程（顺序）
 
-Lambda 路线从空底座到定时监控的顺序（与 §5.2–§5.3、`cd-lambda.yml` 对应）：
+Lambda 路线从空底座到定时监控的顺序（与 §4.2–§4.3、`cd-lambda.yml` 对应）：
 
 ```text
 Infra-admin（账号 972910065688，一次）
@@ -1444,7 +1444,7 @@ Developer
    状态变化 → Teams（enable_webhook=true 且已配 Webhook 时）
 ```
 
-### 5.1 与 Kubernetes 的差异
+### 4.1 与 Kubernetes 的差异
 
 承载方式不同的地方只有三处：
 
@@ -1468,7 +1468,7 @@ Lambda 路线不需要 Docker Hub。`monitor.py` 无第三方依赖，`boto3` �
 
 ---
 
-### 5.2 一次性准备（底座）
+### 4.2 一次性准备（底座）
 
 目标账号是 `LB-INFRA-PROD-972910065688`，Region `ap-east-1`。不要手搓 IAM / Bucket，用 bootstrap Stack 一次建好底座，再跑日常 CD：
 
@@ -1497,8 +1497,8 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides \
     StateBucketName="$STATE_BUCKET" \
-    GitHubOrg=jevinwang-lb \
-    GitHubRepo=portal-monitor-local
+    GitHubOrg=lifebyte-systems-platform-engineering \
+    GitHubRepo=portal-monitor
 ```
 
 两个参数都用模板默认值：`CreateOidcProvider=false` 复用账号现有的 Terraform 托管 Provider，`GitHubRefFilter=ref:refs/heads/main` 限定只有从 `main` dispatch 的 run 能假扮 Deploy Role。部署哪个分支的代码由 workflow 的 `ref` 输入控制，跟这个过滤器无关。
@@ -1507,14 +1507,14 @@ aws cloudformation deploy \
 
 ---
 
-### 5.3 部署
+### 4.3 部署
 
 Actions → **CD - Deploy Lambda** → Run workflow：
 
 ```text
 Use workflow from   main          # OIDC 须匹配 bootstrap 的 GitHubRefFilter
 ref                 main          # 打进 zip 的代码版本
-enable_webhook      true / false  # 见 5.4
+enable_webhook      true / false  # 见 4.4
 ```
 
 Workflow 依次做：打包 zip → 上传 S3 → `aws cloudformation deploy` → 等待函数更新 → 执行一次冒烟调用并打印日志。CD 最后一步在缺少有效 `WEBRISK_API_KEY` 时会失败，属预期；infra 与 key 都就绪后应变绿。
@@ -1530,7 +1530,7 @@ ScheduleExpressionTimezone: Asia/Shanghai
 
 ---
 
-### 5.4 告警（Teams Webhook）
+### 4.4 告警（Teams Webhook）
 
 - **`enable_webhook=false`**（默认）：Lambda 照常查域名、写 `status.json`，不调用 Teams。可不配置 `ALERT_WEBHOOK_URL`。
 - **`enable_webhook=true`**：须在 GitHub 配置 Secret **`ALERT_WEBHOOK_URL`**，CD 会把它写入 Lambda 环境变量。
@@ -1543,7 +1543,7 @@ INFO: ALERT_WEBHOOK_URL not configured
 
 ---
 
-### 5.5 运维
+### 4.5 运维
 
 看日志：
 
@@ -1577,7 +1577,7 @@ Bucket 不在 Stack 内，不会被一起删掉。
 
 ---
 
-### 5.6 注意事项
+### 4.6 注意事项
 
 1. **账号与 Region**：仅 **`972910065688`** / **`ap-east-1`**。bootstrap 不要设 `CreateOidcProvider=true`（会动到全账号共用的 GitHub OIDC Provider）。
 2. **GitHub OIDC `sub`**：2026-07 后新建的仓库带 owner/repo ID，bootstrap 信任策略需含 `repo:org@*/repo@*` 模式（见当前 `aws/bootstrap.yaml`）。CD 必须从 **`main`** dispatch（与 `GitHubRefFilter` 一致）。
@@ -1587,7 +1587,7 @@ Bucket 不在 Stack 内，不会被一起删掉。
 6. **域名与配额**：Web Risk 按 URL 计费；默认定时每天 4 次，注意域名数量与 [免费额度](https://cloud.google.com/web-risk/pricing)（约 10 万次/月）。
 7. **与 Kubernetes 路线**：仓库虽同时含 `k8s/` 与 `aws/`，**生产上只应跑一种**定时监控实例，并只开一路 Teams 告警，避免同一域名变更通知两次。若只用 Lambda，无需操作 EKS / CronJob。
 8. **拆除**：删 Stack `portal-monitor` 不会删 bootstrap 桶（`DeletionPolicy: Retain`）；版本控制桶需按 `BOOTSTRAP.md` §7 按版本清空后再删桶。
-9. **CD 触发**：`cd-lambda.yml` 为 **workflow_dispatch**，不手动 Run 不会部署；临时停用可用 GitHub **Disable workflow**，勿把 YAML 注释掉留在仓库。
+9. **CD 触发**：`cd-lambda.yml` 为 **workflow_dispatch**，不手动 Run 不会部署。Docker / K8s 路线 workflow 暂存于 `.github/workflows-disabled/`（Actions UI 不展示）；Lambda 临时停用可用 GitHub **Disable workflow**。
 
 ---
 
