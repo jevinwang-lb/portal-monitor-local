@@ -125,51 +125,56 @@ jobs:
             | kubectl apply -n "$NAMESPACE" -f -
 
       # --------------------------------------------------
-      # Wait for the pod to start
+      # Wait for the test Job to finish
       #
-      # This is a one-shot deploy. The Job itself can run for
-      # hours (activeDeadlineSeconds), so we do not hold a
-      # runner waiting for it to complete. We only confirm the
-      # image pulls and the container starts.
+      # activeDeadlineSeconds on the Job is 600s, so give it
+      # a little extra headroom before giving up. The Job
+      # itself sets FAIL_ON_ERROR=true, so a real test failure
+      # must fail this step, not just a missing/unready pod.
       # --------------------------------------------------
-      - name: Wait for test pod to start
+      - name: Wait for test Job to finish
         run: |
-          # A short domain list can finish before the wait
-          # returns, in which case the pod is never Ready but
-          # has clearly started. Accept that as success.
-          kubectl wait \
-            --namespace "$NAMESPACE" \
-            --for=condition=ready \
-            --timeout=3m \
-            pod -l app=portal-monitor-test \
-          || kubectl get pod \
-               -n "$NAMESPACE" \
-               -l app=portal-monitor-test \
-               -o jsonpath='{.items[0].status.phase}' \
-             | grep -qE 'Succeeded|Failed'
+          TIMEOUT_SECONDS=660
+          DEADLINE=$(( $(date +%s) + TIMEOUT_SECONDS ))
+
+          while true; do
+            SUCCEEDED=$(kubectl get job portal-monitor-test -n "$NAMESPACE" -o jsonpath='{.status.succeeded}')
+            FAILED=$(kubectl get job portal-monitor-test -n "$NAMESPACE" -o jsonpath='{.status.failed}')
+
+            if [ "$SUCCEEDED" = "1" ]; then
+              echo "Test Job succeeded."
+              exit 0
+            fi
+
+            if [ -n "$FAILED" ] && [ "$FAILED" -ge 1 ]; then
+              echo "Test Job failed."
+              exit 1
+            fi
+
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "Timed out waiting for test Job to finish."
+              exit 1
+            fi
+
+            sleep 10
+          done
 
       # --------------------------------------------------
       # Show logs
-      #
-      # The Job is still running at this point, so this is a
-      # startup smoke check, not the final result.
       # --------------------------------------------------
-      - name: Show startup logs
+      - name: Show Job logs
         if: always()
         run: |
           kubectl logs \
             --namespace "$NAMESPACE" \
-            --tail=50 \
+            --tail=100 \
             job/portal-monitor-test \
             || true
 
       # --------------------------------------------------
-      # Show test status
-      #
-      # The Job is left running. Check DURATION and the final
-      # result with the commands printed below.
+      # Show final Job status
       # --------------------------------------------------
-      - name: Show test status
+      - name: Show final Job status
         if: always()
         run: |
           kubectl get job \
@@ -179,8 +184,3 @@ jobs:
           kubectl get pod \
             -n "$NAMESPACE" \
             -l app=portal-monitor-test
-
-          echo
-          echo "Job is still running. To follow it:"
-          echo "  kubectl logs -f -n $NAMESPACE job/portal-monitor-test"
-          echo "  kubectl get job portal-monitor-test -n $NAMESPACE -w"

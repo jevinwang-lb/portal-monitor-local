@@ -933,7 +933,7 @@ STATUS: Complete
 
 测试 Job 设置了 `FAIL_ON_ERROR=true`：`CHECK_ERROR` 或 Webhook 失败时进程非 0 退出，Job 被标记为 Failed。API Key 无效会直接以 `2` 退出。
 
-CD 是一次性部署，只等待 Pod 启动（3 分钟），不等待 Job 跑完，因此**不会**因为 Job 失败而失败。Job 的最终结果需要自行查看：
+CD 会轮询等待这个 Job 跑完（最多 660 秒，比 `activeDeadlineSeconds: 600` 略留余量），根据 `status.succeeded` / `status.failed` 判断结果：Job 失败或超时，CD 这一步就会失败，不再只看 Pod 是否启动。Job 的完整日志和最终状态会在后续步骤里打印，也可以自行查看：
 
 ```bash
 kubectl get job portal-monitor-test -n portal-monitor

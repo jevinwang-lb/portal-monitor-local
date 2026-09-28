@@ -2,6 +2,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: portal-monitor-config
+  namespace: portal-monitor
 data:
   domains.txt: |
     bilibili.com

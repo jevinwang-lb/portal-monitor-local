@@ -893,27 +893,12 @@ def main():
 
 
     # ========================================================
-    # Save state
-    # ========================================================
-
-    save_state(
-        new_state
-    )
-
-    print()
-
-    print(
-        "=" * 60
-    )
-
-    print(
-        "State saved:",
-        STATE_FILE,
-    )
-
-
-    # ========================================================
     # Notifications
+    #
+    # Send before saving state. A domain whose webhook fails
+    # has its saved status rolled back to what it was before
+    # this run, so the change is detected and re-notified on
+    # the next run instead of being silently swallowed.
     # ========================================================
 
     if notification_events:
@@ -954,6 +939,22 @@ def main():
 
                 webhook_failures += 1
 
+                domain = event["domain"]
+                previous = event["previous"]
+
+                if previous is None:
+
+                    new_state.pop(
+                        domain,
+                        None,
+                    )
+
+                else:
+
+                    new_state[
+                        domain
+                    ] = previous
+
     else:
 
         print()
@@ -961,6 +962,26 @@ def main():
         print(
             "No notification events."
         )
+
+
+    # ========================================================
+    # Save state
+    # ========================================================
+
+    save_state(
+        new_state
+    )
+
+    print()
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        "State saved:",
+        STATE_FILE,
+    )
 
 
     # ========================================================
