@@ -302,8 +302,8 @@
       <a href="#docker">2. Docker</a>
       <a href="#k8s">3. Kubernetes</a>
       <a href="#k8s-flow">K8s 流程</a>
-      <a href="#cicd">4. CI / CD</a>
-      <a href="#lambda">5. Lambda</a>
+      <a href="#cicd">CI / CD</a>
+      <a href="#lambda">4. Lambda</a>
       <a href="#debug">排障</a>
     </nav>
 
@@ -376,9 +376,9 @@
           <li>读状态文件（本机 <code>status.json</code>；K8s PVC <code>/data/status.json</code>；Lambda S3 ↔ <code>/tmp/status.json</code>）。不存在则视为空。</li>
           <li>逐个条目补全 URI（裸域名加 <code>https://</code>），GET <code>uris:search</code>。</li>
           <li>异常最多重试 3 次（<code>MAX_RETRIES</code>），间隔 <code>RETRY_DELAY_SECONDS</code>。</li>
-          <li>决定是否覆盖状态、是否加入通知队列。</li>
-          <li>先写 <code>status.json.tmp</code> 再原子替换，避免写一半损坏。</li>
-          <li>对每个 <code>status_changed</code> 事件 POST 到 <code>ALERT_WEBHOOK_URL</code>。</li>
+          <li>决定是否覆盖状态、是否加入通知队列（先在内存里算好，还没落盘）。</li>
+          <li>对每个 <code>status_changed</code> 事件 POST 到 <code>ALERT_WEBHOOK_URL</code>；某个域名发送失败，就把它的内存状态回滚成变化前的值。</li>
+          <li>都处理完后再写状态：先写 <code>status.json.tmp</code> 再原子替换，避免写一半损坏，也避免把发送失败的告警当成已经发出。</li>
         </ol>
 
         <p>请求形如：</p>
@@ -487,6 +487,10 @@ UNWANTED_SOFTWARE</pre>
           遇到 CHECK_ERROR 时，若该域名已有上次 SAFE / UNSAFE，会<strong>保留旧值</strong>，
           避免一次 API 抽风冲掉状态。首次就 CHECK_ERROR 时，<code>status.json</code> 里可以没有这条 key。
         </p>
+        <p>
+          Webhook 发送失败也会<strong>保留旧值</strong>：那次 SAFE ↔ UNSAFE 的变化不会被当成「已经发出」，
+          下一轮还会看到同样的变化并再发一次通知，而不是被状态覆盖悄悄吞掉。
+        </p>
         <p class="muted"><code>status.json</code> 只存每个条目最后一次有效 SAFE / UNSAFE，不存历史。</p>
       </section>
 
@@ -500,6 +504,7 @@ UNWANTED_SOFTWARE</pre>
             <tr><td><code>app/monitor.py</code></td><td>Lookup 调用、解析、状态、Webhook</td></tr>
             <tr><td><code>domains.txt</code></td><td>本机默认列表；K8s 会被 ConfigMap 覆盖</td></tr>
             <tr><td><code>Dockerfile</code></td><td><code>python:3.13-slim</code>；状态写到 <code>/data/status.json</code></td></tr>
+            <tr><td><code>k8s/storageclass.yaml</code></td><td>gp3 StorageClass，两个 PVC 都靠它 Bound</td></tr>
             <tr><td><code>k8s/configmap.yaml</code></td><td>集群监控列表（改域名只 apply，不必重建镜像）</td></tr>
             <tr><td><code>k8s/pvc.yaml</code></td><td>生产状态盘 <code>portal-monitor-state</code></td></tr>
             <tr><td><code>k8s/test-pvc.yaml</code></td><td>测试状态盘 <code>portal-monitor-state-test</code></td></tr>
@@ -616,7 +621,7 @@ python3 app/monitor.py</pre>
         </ul>
 
         <h3 id="k8s-flow">Current Deployment Model（Kubernetes）</h3>
-        <p class="muted">与下文「4. CI / CD」及本节 manifest 对应。</p>
+        <p class="muted">与下文「CI / CD」及本节 manifest 对应。</p>
         <pre>Developer
    │
    └── git push main
@@ -650,10 +655,8 @@ Docker Hub :sha-xxxxxxx
       Status Change
           ↓
       Teams Alert</pre>
-      </section>
 
-      <section id="cicd">
-        <h2>4. CI / CD（Kubernetes 路线）</h2>
+        <h3 id="cicd">CI / CD 流程</h3>
         <p class="muted">日常测试跟 <code>main</code> 的 SHA；生产跟 Semver tag。不要把未验证的 <code>sha-…</code> 直接指到 CronJob。Lambda 部署见下一节。</p>
 
         <div class="pipe">
@@ -673,7 +676,9 @@ Docker Hub :sha-xxxxxxx
             <p>
               CI 成功后 <code>cd-test-job.yml</code> 自动跑 SHA 镜像（也可手动填 tag）。
               Runner <code>arc-runner-set-portal</code> apply 测试 PVC + ConfigMap，跑
-              <code>portal-monitor-test</code> 并打日志。
+              <code>portal-monitor-test</code>。CD 会轮询等 Job 跑完（最长约 660 秒）并按
+              <code>succeeded</code> / <code>failed</code> 判定这一步，Job 失败或超时 CD 就红，
+              不再只看 Pod 有没有启动。
             </p>
           </div>
           <div class="pipe-arrow">↓</div>
@@ -705,11 +710,11 @@ Docker Hub :sha-xxxxxxx
       </section>
 
       <section id="lambda">
-        <h2>5. AWS Lambda（独立部署）</h2>
+        <h2>4. AWS Lambda（独立部署）</h2>
         <p>
           在 <strong>LB-INFRA-PROD-972910065688</strong>、Region <strong>ap-east-1</strong> 上运行：
           EventBridge 定时触发 Lambda，<code>domains.txt</code> 与 <code>status.json</code> 在 S3，
-          CD 经 GitHub Actions OIDC 假扮 IAM Role。不需要 EKS、Docker Hub 或本节的 CI/CD 流水线。
+          CD 经 GitHub Actions OIDC 假扮 IAM Role。不需要 EKS、Docker Hub 或上一节的 CI/CD 流水线。
         </p>
 
         <h3>部署流程（顺序）</h3>
